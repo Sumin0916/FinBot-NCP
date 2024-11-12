@@ -201,6 +201,74 @@ class HCX_003_QAModel(BaseQAModel):
         self.request_id = HCX_003_CONFIG['request_id']
         self.endpoint = HCX_003_CONFIG['endpoint']
 
+    def generate_search_question(self, question):
+        """
+        주어진 질문을 기반으로 검색에 최적화된 질문을 생성
+        
+        Args:
+            question (str): 원본 질문
+            
+        Returns:
+            str: 검색용으로 변환된 질문
+        """
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": """당신은 검색 최적화 전문가입니다. 주어진 질문을 분석하여, 해당 질문에 답변하기 위해 필요한 정보를 찾는데 최적화된 검색 문장을 생성해주세요. 
+                    핵심 키워드와 중요 정보를 포함하되, 검색에 효과적인 형태로 변환해주세요.
+
+                    예시:
+                    1. 원본 질문: "회사의 부채비율은 어떻게 되나요?"
+                    검색 문장: "부채비율은 RATIO% 수준"
+
+                    2. 원본 질문: "영업이익률이 어떻게 변화했나요?"
+                    검색 문장: "영업이익률은 전년 대비"
+
+                    3. 원본 질문: "주요 매출 성장 동력은 무엇인가요?"
+                    검색 문장: "매출 성장은 주로 사업부문이"
+
+                    4. 원본 질문: "연구개발 투자는 얼마나 하고 있나요?"
+                    검색 문장: "연구개발비는 XXX억원을 투자"
+
+                    5. 원본 질문: "현금흐름이 어떻게 되나요?"
+                    검색 문장: "영업활동 현금흐름은"
+
+                    6. 원본 질문: "배당 정책은 어떻게 되나요?"
+                    검색 문장: "배당성향은 수준을 유지"
+
+                    7. 원본 질문: "신규 사업 계획이 있나요?"
+                    검색 문장: "신규 사업으로 추진"
+
+                    8. 원본 질문: "ESG 활동은 어떻게 하고 있나요?"
+                    검색 문장: "ESG 경영을 위해"
+
+                    주의사항:
+                    - 재무제표나 사업보고서에서 흔히 사용되는 문구 스타일로 변환
+                    - 불필요한 수식어 제거
+                    - 핵심 키워드를 문장 앞쪽에 배치
+                    - 재무 용어는 공시 자료에서 사용하는 정확한 용어로 변환
+                    """
+                },
+                {
+                    "role": "user",
+                    "content": f"다음 질문에 답변하기 위해 필요한 정보를 찾기 위한 검색 문장을 생성해주세요. 답변은 재무제표에 있길 원하는 원본 문장과 유사하도록 출력하세요.\n\n질문: {question}"
+                }
+            ]
+            
+            response = self._send_request(messages)
+            
+            if response['status']['code'] == '20000':
+                search_question = response['result']['message']['content'].strip()
+                return search_question
+            else:
+                logging.error(f"Error in search question generation: {response}")
+                return question
+                
+        except Exception as e:
+            logging.error(f"Exception in search question generation: {e}")
+            return question
+
     def _send_request(self, messages):
         """
         CLOVA Studio API에 요청을 보내는 내부 메서드
@@ -220,7 +288,7 @@ class HCX_003_QAModel(BaseQAModel):
             "temperature": 0.3,
             "repeatPenalty": 5.0,
             "stopBefore": [],
-            "includeAiFilters": True
+            "includeAiFilters":False
         }
         
         conn = http.client.HTTPSConnection(self.host)

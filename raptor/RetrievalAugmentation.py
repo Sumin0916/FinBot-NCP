@@ -3,7 +3,7 @@ import pickle
 
 from .cluster_tree_builder import ClusterTreeBuilder, ClusterTreeConfig
 from .EmbeddingModels import BaseEmbeddingModel
-from .QAModels import BaseQAModel, GPT3TurboQAModel
+from .QAModels import BaseQAModel, GPT3TurboQAModel, HCX_003_QAModel
 from .SummarizationModels import BaseSummarizationModel
 from .tree_builder import TreeBuilder, TreeBuilderConfig
 from .tree_retriever import TreeRetriever, TreeRetrieverConfig
@@ -293,8 +293,10 @@ class RetrievalAugmentation:
             ValueError: If the TreeRetriever instance has not been initialized.
         """
         # if return_layer_information:
+        search_question = self.qa_model.generate_search_question(question)
+        logging.info(f"질문을 해결하기 위한 검색어: {search_question}")
         context, layer_information = self.retrieve(
-            question, start_layer, num_layers, top_k, max_tokens, collapse_tree, True
+            search_question, start_layer, num_layers, top_k, max_tokens, collapse_tree, True
         )
 
         answer = self.qa_model.answer_question(context, question)

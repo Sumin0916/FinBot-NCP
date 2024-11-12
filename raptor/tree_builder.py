@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+import tqdm
 import openai
 import tiktoken
 from tenacity import retry, stop_after_attempt, wait_random_exponential
@@ -289,17 +290,18 @@ class TreeBuilder:
 
     def build_from_text(self, input_data: Union[str, dict, list], use_multithreading: bool = True) -> Tree:
         """Builds a golden tree from the input text or JSON data, optionally using multithreading.
-
+        
         Args:
             input_data (Union[str, dict]): The input text or JSON data.
                 - If using regular tokenizer: input should be str
                 - If using FinQATokenizer: input should be dict (JSON format)
             use_multithreading (bool, optional): Whether to use multithreading when creating leaf nodes.
                 Default: True.
-
+        
         Returns:
             Tree: The golden tree structure.
         """
+        
         # 입력 타입과 토크나이저 타입에 따른 청크 생성
         if isinstance(self.tokenizer, FinQATokenizer):
             if not (isinstance(input_data, dict) or isinstance(input_data, list)):
@@ -314,12 +316,18 @@ class TreeBuilder:
                         for index, (chunk_meta, chunk_text) in enumerate(meta_chunks)
                     }
                     
-                    for future in as_completed(future_nodes):
-                        index, node = future.result()
-                        leaf_nodes[index] = node
+                    # tqdm으로 진행상황 표시
+                    with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
+                        for future in as_completed(future_nodes):
+                            index, node = future.result()
+                            leaf_nodes[index] = node
+                            pbar.update(1)
             else:
                 leaf_nodes = {}
-                for index, (chunk_meta, chunk_text) in enumerate(meta_chunks):
+                # tqdm으로 진행상황 표시
+                for index, (chunk_meta, chunk_text) in tqdm(enumerate(meta_chunks), 
+                                                        total=len(meta_chunks),
+                                                        desc="Creating nodes"):
                     __, node = self.create_node(index, chunk_text, meta_data=chunk_meta)
                     leaf_nodes[index] = node
         
@@ -329,13 +337,28 @@ class TreeBuilder:
             chunks = split_text(input_data, self.tokenizer, self.max_tokens)
             
             if use_multithreading:
-                leaf_nodes = self.multithreaded_create_leaf_nodes(chunks)
+                leaf_nodes = {}
+                with ThreadPoolExecutor() as executor:
+                    future_nodes = {
+                        executor.submit(self.create_node, index, text): (index, text)
+                        for index, text in enumerate(chunks)
+                    }
+                    
+                    # tqdm으로 진행상황 표시
+                    with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
+                        for future in as_completed(future_nodes):
+                            index, node = future.result()
+                            leaf_nodes[index] = node
+                            pbar.update(1)
             else:
                 leaf_nodes = {}
-                for index, text in enumerate(chunks):
+                # tqdm으로 진행상황 표시
+                for index, text in tqdm(enumerate(chunks), 
+                                    total=len(chunks),
+                                    desc="Creating nodes"):
                     __, node = self.create_node(index, text)
                     leaf_nodes[index] = node
-
+    
         layer_to_nodes = {0: list(leaf_nodes.values())}
         logging.info(f"Created {len(leaf_nodes)} Leaf Embeddings")
         logging.info("Building All Nodes")
