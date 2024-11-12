@@ -2,7 +2,8 @@ import logging
 import os
 
 from openai import OpenAI
-
+import json
+import http
 
 import getpass
 from abc import ABC, abstractmethod
@@ -10,7 +11,12 @@ from abc import ABC, abstractmethod
 import torch
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 from transformers import T5ForConditionalGeneration, T5Tokenizer
-
+from .config import (
+    CLOVA_HOST, 
+    CLOVA_API_KEY, 
+    CLOVA_API_GATEWAY_KEY, 
+    HCX_003_CONFIG,
+)
 
 class BaseQAModel(ABC):
     @abstractmethod
@@ -183,3 +189,85 @@ class UnifiedQAModel(BaseQAModel):
         input_string = question + " \\n " + context
         output = self.run_model(input_string)
         return output[0]
+
+class HCX_003_QAModel(BaseQAModel):
+    def __init__(self):
+        """
+        HyperCLOVA X 모델을 사용하는 QA 모델 초기화
+        """
+        self.api_key = CLOVA_API_KEY
+        self.api_gateway_key = CLOVA_API_GATEWAY_KEY
+        self.host = CLOVA_HOST
+        self.request_id = HCX_003_CONFIG['request_id']
+        self.endpoint = HCX_003_CONFIG['endpoint']
+
+    def _send_request(self, messages):
+        """
+        CLOVA Studio API에 요청을 보내는 내부 메서드
+        """
+        headers = {
+            'Content-Type': 'application/json',
+            'X-NCP-CLOVASTUDIO-API-KEY': self.api_key,
+            'X-NCP-APIGW-API-KEY': self.api_gateway_key,
+            'X-NCP-CLOVASTUDIO-REQUEST-ID': self.request_id
+        }
+        
+        request_data = {
+            "messages": messages,
+            "topP": 0.8,
+            "topK": 0,
+            "maxTokens": 256,
+            "temperature": 0.3,
+            "repeatPenalty": 5.0,
+            "stopBefore": [],
+            "includeAiFilters": True
+        }
+        
+        conn = http.client.HTTPSConnection(self.host)
+        conn.request(
+            'POST',
+            self.endpoint,
+            json.dumps(request_data),
+            headers
+        )
+        
+        response = conn.getresponse()
+        result = json.loads(response.read().decode('utf-8'))
+        conn.close()
+        return result
+
+    @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
+    def answer_question(self, context, question):
+        """
+        주어진 컨텍스트를 기반으로 질문에 답변
+        
+        Args:
+            context (str): 참고할 문맥 정보
+            question (str): 답변할 질문
+            
+        Returns:
+            str: 생성된 답변
+        """
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "당신은 전문 지식을 가진 금융 분석가입니다. 주어진 문맥을 기반으로 질문에 대해 정확하고 간단명료하게 답변해주세요. 불필요한 설명은 제외하고, 핵심적인 정보만 제공해주세요."
+                },
+                {
+                    "role": "user",
+                    "content": f"다음 정보를 참고하여 질문에 답변해주세요:\n\n문맥: {context}\n\n질문: {question}"
+                }
+            ]
+            
+            response = self._send_request(messages)
+            
+            if response['status']['code'] == '20000':
+                return response['result']['message']['content'].strip()
+            else:
+                logging.error(f"Error in CLOVA Studio API: {response}")
+                raise Exception(f"Error: {response['status']['message']}")
+                
+        except Exception as e:
+            logging.error(f"Exception in HCX-003 question answering: {e}")
+            raise e

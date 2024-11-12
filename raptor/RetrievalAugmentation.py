@@ -35,6 +35,8 @@ class RetrievalAugmentationConfig:
         tr_num_layers=None,
         tr_start_layer=None,
         # TreeBuilderConfig arguments
+        tb_clustering_algorithm=None,  # 추가
+        tb_clustering_params = {},
         tb_tokenizer=None,
         tb_max_tokens=100,
         tb_num_layers=5,
@@ -45,6 +47,7 @@ class RetrievalAugmentationConfig:
         tb_summarization_model=None,
         tb_embedding_models=None,
         tb_cluster_embedding_model="OpenAI",
+        tb_metadata_extract_model=None,
     ):
         # Validate tree_builder_type
         if tree_builder_type not in supported_tree_builders:
@@ -102,6 +105,9 @@ class RetrievalAugmentationConfig:
                 summarization_model=tb_summarization_model,
                 embedding_models=tb_embedding_models,
                 cluster_embedding_model=tb_cluster_embedding_model,
+                metadata_extract_model = tb_metadata_extract_model,
+                clustering_algorithm=tb_clustering_algorithm,  # 추가
+                clustering_params=tb_clustering_params,
             )
 
         elif not isinstance(tree_builder_config, tree_builder_config_class):
@@ -216,7 +222,7 @@ class RetrievalAugmentation:
                 # self.add_to_existing(docs)
                 return
 
-        self.tree = self.tree_builder.build_from_text(text=docs)
+        self.tree = self.tree_builder.build_from_text(input_data=docs)
         self.retriever = TreeRetriever(self.tree_retriever_config, self.tree)
 
     def retrieve(

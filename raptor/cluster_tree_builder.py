@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from typing import Dict, List, Set
 
-from .cluster_utils import ClusteringAlgorithm, RAPTOR_Clustering
+from .cluster_utils import ClusteringAlgorithm, RAPTOR_Clustering, FinRAG_Clustering
 from .tree_builder import TreeBuilder, TreeBuilderConfig
 from .tree_structures import Node, Tree
 from .utils import (distances_from_embeddings, get_children, get_embeddings,
@@ -27,6 +27,23 @@ class ClusterTreeConfig(TreeBuilderConfig):
         self.reduction_dimension = reduction_dimension
         self.clustering_algorithm = clustering_algorithm
         self.clustering_params = clustering_params
+        self.summarization_length = 100
+        
+        if clustering_algorithm == RAPTOR_Clustering:
+            self.summarization_length = 100  # RAPTOR는 모든 레이어에서 100 고정
+        if clustering_algorithm == FinRAG_Clustering:  # FinRAG_Clustering인 경우
+            self.layer_summarization_lengths = {
+                0: 300,  # Layer 0 -> 1
+                1: 200,  # Layer 1 -> 2
+                2: 100,  # Layer 2 -> 3
+                3: 1000, # Layer 3 -> 4
+            }
+
+    def get_summarization_length(self, layer):
+        """Get summarization length for specific layer"""
+        if self.clustering_algorithm == RAPTOR_Clustering:
+            return 100  # RAPTOR는 항상 100 반환
+        return self.layer_summarization_lengths.get(layer, self.summarization_length)
 
     def log_config(self):
         base_summary = super().log_config()
@@ -35,6 +52,8 @@ class ClusterTreeConfig(TreeBuilderConfig):
         Clustering Algorithm: {self.clustering_algorithm.__name__}
         Clustering Parameters: {self.clustering_params}
         """
+        if self.clustering_algorithm != RAPTOR_Clustering:
+            cluster_tree_summary += f"\nLayer Summarization Lengths: {self.layer_summarization_lengths}"
         return base_summary + cluster_tree_summary
 
 
@@ -64,9 +83,11 @@ class ClusterTreeBuilder(TreeBuilder):
         next_node_index = len(all_tree_nodes)
 
         def process_cluster(
-            cluster, new_level_nodes, next_node_index, summarization_length, lock
+            cluster, new_level_nodes, next_node_index, layer, lock
         ):
             node_texts = get_text(cluster)
+
+            summarization_length = self.config.get_summarization_length(layer)
 
             summarized_text = self.summarize(
                 context=node_texts,
@@ -74,7 +95,9 @@ class ClusterTreeBuilder(TreeBuilder):
             )
 
             logging.info(
-                f"Node Texts Length: {len(self.tokenizer.encode(node_texts))}, Summarized Text Length: {len(self.tokenizer.encode(summarized_text))}"
+            f"Layer {layer} - Node Texts Length: {len(self.tokenizer.encode(node_texts))}, "
+            f"Summarized Text Length: {len(self.tokenizer.encode(summarized_text))} "
+            f"(Target Length: {summarization_length})"
             )
 
             __, new_parent_node = self.create_node(
@@ -102,6 +125,7 @@ class ClusterTreeBuilder(TreeBuilder):
             clusters = self.clustering_algorithm.perform_clustering(
                 node_list_current_layer,
                 self.cluster_embedding_model,
+                layer=layer,  # 현재 레이어 정보 전달
                 reduction_dimension=self.reduction_dimension,
                 **self.clustering_params,
             )
@@ -119,7 +143,7 @@ class ClusterTreeBuilder(TreeBuilder):
                             cluster,
                             new_level_nodes,
                             next_node_index,
-                            summarization_length,
+                            layer,
                             lock,
                         )
                         next_node_index += 1
@@ -131,7 +155,7 @@ class ClusterTreeBuilder(TreeBuilder):
                         cluster,
                         new_level_nodes,
                         next_node_index,
-                        summarization_length,
+                        layer,
                         lock,
                     )
                     next_node_index += 1

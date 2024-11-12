@@ -4,16 +4,19 @@ import os
 from abc import abstractclassmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import openai
 import tiktoken
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
+from .ExtractModel import HCX_003_MetaDataExecutor
 from .EmbeddingModels import BaseEmbeddingModel, OpenAIEmbeddingModel
 from .SummarizationModels import (BaseSummarizationModel,
                                   GPT3TurboSummarizationModel)
+
 from .tree_structures import Node, Tree
+from .custom_tokenizer import FinQATokenizer
 from .utils import (distances_from_embeddings, get_children, get_embeddings,
                     get_node_list, get_text,
                     indices_of_nearest_neighbors_from_distances, split_text)
@@ -34,6 +37,7 @@ class TreeBuilderConfig:
         summarization_model=None,
         embedding_models=None,
         cluster_embedding_model=None,
+        metadata_extract_model=None,
     ):
         if tokenizer is None:
             tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -102,6 +106,14 @@ class TreeBuilderConfig:
             )
         self.cluster_embedding_model = cluster_embedding_model
 
+        if metadata_extract_model is None:
+            metadata_extract_model = "HCX-003"
+        if metadata_extract_model not in ["HCX-003"]:
+            raise ValueError(
+                "metadata_extract_model must be 'HCX-003'"
+            )
+        self.metadata_extract_model = HCX_003_MetaDataExecutor()
+
     def log_config(self):
         config_log = """
         TreeBuilderConfig:
@@ -150,13 +162,18 @@ class TreeBuilder:
         self.summarization_model = config.summarization_model
         self.embedding_models = config.embedding_models
         self.cluster_embedding_model = config.cluster_embedding_model
+        self.metadata_executor = config.metadata_extract_model
 
         logging.info(
             f"Successfully initialized TreeBuilder with Config {config.log_config()}"
         )
 
     def create_node(
-        self, index: int, text: str, children_indices: Optional[Set[int]] = None
+        self, 
+        index: int, 
+        text: str, 
+        children_indices: Optional[Set[int]] = None,
+        meta_data: Dict = None
     ) -> Tuple[int, Node]:
         """Creates a new node with the given index, text, and (optionally) children indices.
 
@@ -172,6 +189,19 @@ class TreeBuilder:
         if children_indices is None:
             children_indices = set()
 
+        # # FinQA 토크나이저인 경우에만 메타데이터 딕셔너리 추가
+        # if isinstance(self.tokenizer, FinQATokenizer):
+        #     if not self.metadata_executor:
+        #         raise ValueError(
+        #         "FinQATokenizer need metadata_executor"
+        #     )
+        #     embeddings = {
+        #         model_name: model.create_embedding(text)
+        #         for model_name, model in self.embedding_models.items()
+        #     }
+        #     return (index, Node(text, index, children_indices, embeddings, meta_data))
+        
+        # 일반적인 경우는 원래 로직 그대로 사용
         embeddings = {
             model_name: model.create_embedding(text)
             for model_name, model in self.embedding_models.items()
@@ -257,43 +287,65 @@ class TreeBuilder:
 
         return leaf_nodes
 
-    def build_from_text(self, text: str, use_multithreading: bool = True) -> Tree:
-        """Builds a golden tree from the input text, optionally using multithreading.
+    def build_from_text(self, input_data: Union[str, dict, list], use_multithreading: bool = True) -> Tree:
+        """Builds a golden tree from the input text or JSON data, optionally using multithreading.
 
         Args:
-            text (str): The input text.
+            input_data (Union[str, dict]): The input text or JSON data.
+                - If using regular tokenizer: input should be str
+                - If using FinQATokenizer: input should be dict (JSON format)
             use_multithreading (bool, optional): Whether to use multithreading when creating leaf nodes.
                 Default: True.
 
         Returns:
             Tree: The golden tree structure.
         """
-        chunks = split_text(text, self.tokenizer, self.max_tokens)
-
-        logging.info("Creating Leaf Nodes")
-
-        if use_multithreading:
-            leaf_nodes = self.multithreaded_create_leaf_nodes(chunks)
-        else:
-            leaf_nodes = {}
-            for index, text in enumerate(chunks):
-                __, node = self.create_node(index, text)
-                leaf_nodes[index] = node
+        # 입력 타입과 토크나이저 타입에 따른 청크 생성
+        if isinstance(self.tokenizer, FinQATokenizer):
+            if not (isinstance(input_data, dict) or isinstance(input_data, list)):
+                raise ValueError("When using FinQATokenizer, input_data must be a dictionary")
+            meta_chunks = self.tokenizer.encode(input_data)  # (dict, str) 형식의 리스트 반환
+            
+            if use_multithreading:
+                leaf_nodes = {}
+                with ThreadPoolExecutor() as executor:
+                    future_nodes = {
+                        executor.submit(self.create_node, index, chunk_text, meta_data=chunk_meta): (index, chunk_text)
+                        for index, (chunk_meta, chunk_text) in enumerate(meta_chunks)
+                    }
+                    
+                    for future in as_completed(future_nodes):
+                        index, node = future.result()
+                        leaf_nodes[index] = node
+            else:
+                leaf_nodes = {}
+                for index, (chunk_meta, chunk_text) in enumerate(meta_chunks):
+                    __, node = self.create_node(index, chunk_text, meta_data=chunk_meta)
+                    leaf_nodes[index] = node
+        
+        else:  # 일반 토크나이저 사용시
+            if not isinstance(input_data, str):
+                raise ValueError("When using regular tokenizer, input_data must be a string")
+            chunks = split_text(input_data, self.tokenizer, self.max_tokens)
+            
+            if use_multithreading:
+                leaf_nodes = self.multithreaded_create_leaf_nodes(chunks)
+            else:
+                leaf_nodes = {}
+                for index, text in enumerate(chunks):
+                    __, node = self.create_node(index, text)
+                    leaf_nodes[index] = node
 
         layer_to_nodes = {0: list(leaf_nodes.values())}
-
         logging.info(f"Created {len(leaf_nodes)} Leaf Embeddings")
-
         logging.info("Building All Nodes")
 
         all_nodes = copy.deepcopy(leaf_nodes)
-
         root_nodes = self.construct_tree(all_nodes, all_nodes, layer_to_nodes)
-
         tree = Tree(all_nodes, root_nodes, leaf_nodes, self.num_layers, layer_to_nodes)
 
         return tree
-
+    
     @abstractclassmethod
     def construct_tree(
         self,
