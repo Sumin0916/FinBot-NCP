@@ -1,7 +1,8 @@
 import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List
 import requests
+import http.client
 
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 from .config import (
@@ -9,8 +10,53 @@ from .config import (
     CLOVA_API_KEY, 
     CLOVA_API_GATEWAY_KEY, 
     HCX_003_CONFIG,
+    HCX_SEGMENTATION_CONFIG,
 )
         
+def chunk_text(text: str, max_tokens: int) -> str:
+        """
+        텍스트를 길이 기준으로 검사하고 필요시 절삭
+        
+        Args:
+            text (str): 처리할 텍스트
+            max_tokens (int): 최대 허용 토큰 수
+        
+        Returns:
+            str: 처리된 텍스트
+        """
+        logger = logging.getLogger(__name__)
+        
+        # 텍스트 길이의 80%를 계산
+        text_length = len(text)
+        threshold_length = int(text_length * 0.8)
+        
+        # 80% 길이가 최대 토큰 수를 초과하는지 확인
+        if threshold_length > max_tokens:
+            # 로깅
+            logger.warning(
+                f"텍스트가 최대 허용 길이를 초과합니다.\n"
+                f"원본 길이: {text_length}\n"
+                f"80% 길이: {threshold_length}\n"
+                f"최대 토큰: {max_tokens}\n"
+                f"텍스트가 {max_tokens}토큰까지 절삭됩니다."
+            )
+            
+            # 텍스트를 max_tokens까지 잘라내기
+            # 문장 중간 절단을 피하기 위해 마지막 마침표나 띄어쓰기를 찾아서 자름
+            cutoff_text = text[:max_tokens]
+            last_period = cutoff_text.rfind('.')
+            last_space = cutoff_text.rfind(' ')
+            
+            # 마침표나 띄어쓰기 중 더 뒤에 있는 위치에서 자르기
+            cut_position = max(last_period, last_space)
+            if cut_position == -1:  # 마침표나 띄어쓰기가 없는 경우
+                cut_position = max_tokens
+            
+            return text[:cut_position].strip()
+        
+        # 길이가 초과하지 않으면 원본 텍스트 반환
+        return text
+
 
 class HCX_003_MetaDataExecutor:
     def __init__(self):
@@ -139,7 +185,7 @@ class HCX_003_MetaDataExecutor:
         """
         try:
             self.logger.info("Starting metadata extraction...")
-            
+            financial_text = chunk_text(financial_text) #청크 텍스트 중복 코드임
             messages = [
                 self.system_prompt,
                 {"role": "user", "content": financial_text}
@@ -167,7 +213,7 @@ class HCX_003_MetaDataExecutor:
 
             full_response = ""
             with requests.post(
-                self._host + self.endpoint,
+                "https://" + self._host + self.endpoint,
                 headers=headers,
                 json=request_data,
                 stream=True
@@ -200,3 +246,112 @@ class HCX_003_MetaDataExecutor:
                 "success": False,
                 "error": f"Unexpected error: {str(e)}"
             }
+
+
+class CLOVASegmentationExecutor:
+    def __init__(self):
+        """
+        CLOVA Studio API를 사용하여 텍스트 세그멘테이션을 수행하는 실행기 초기화
+        """
+        self._host = CLOVA_HOST
+        self._api_key = CLOVA_API_KEY
+        self._api_key_primary_val = CLOVA_API_GATEWAY_KEY
+        self.request_id = HCX_SEGMENTATION_CONFIG['request_id']
+        self.endpoint = HCX_SEGMENTATION_CONFIG['endpoint']
+        self.logger = logging.getLogger(__name__)
+
+    def _send_request(self, completion_request: Dict) -> Dict[str, Any]:
+        """
+        CLOVA Studio API에 요청을 보내는 내부 메서드
+        
+        Args:
+            completion_request (Dict): API 요청 데이터
+            
+        Returns:
+            Dict[str, Any]: API 응답 결과
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json; charset=utf-8',
+                'X-NCP-CLOVASTUDIO-API-KEY': self._api_key,
+                'X-NCP-APIGW-API-KEY': self._api_key_primary_val,
+                'X-NCP-CLOVASTUDIO-REQUEST-ID': self.request_id
+            }
+            
+            conn = http.client.HTTPSConnection(self._host)
+            conn.request('POST', self.endpoint, json.dumps(completion_request), headers)
+            
+            response = conn.getresponse()
+            result = json.loads(response.read().decode('utf-8'))
+            conn.close()
+            
+            self.logger.debug(f"API Response: {result}")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"API request failed: {str(e)}")
+            raise
+
+    def execute(self, text: str, post_process: bool = False, 
+                seg_cnt: int = -1, alpha: float = 0.0,
+                min_size: int = 300, max_size: int = 1000) -> str:
+        """
+        텍스트 세그멘테이션 실행
+        
+        Args:
+            text (str): 세그멘테이션할 텍스트
+            post_process (bool): 후처리 여부
+            seg_cnt (int): 세그먼트 수 (-1은 자동)
+            alpha (float): 알파 파라미터
+            min_size (int): 최소 세그먼트 크기
+            max_size (int): 최대 세그먼트 크기
+            
+        Returns:
+            str: 세그멘테이션 결과 또는 에러 메시지
+        """
+        try:
+            self.logger.info("Starting text segmentation...")
+            
+            request_data = {
+                "text": text,
+                "postProcess": post_process,
+                "segCnt": seg_cnt,
+                "alpha": alpha,
+                "postProcessMinSize": min_size,
+                "postProcessMaxSize": max_size
+            }
+            
+            result = self._send_request(request_data)
+            
+            if result['status']['code'] == '20000':
+                self.logger.info("Segmentation completed successfully")
+                return result['result']['topicSeg']
+            else:
+                error_msg = f"Error: {result['status']['code']} - {result['status'].get('message', 'Unknown error')}"
+                self.logger.error(error_msg)
+                return 'Error'
+                
+        except Exception as e:
+            self.logger.error(f"Segmentation execution failed: {str(e)}")
+            return 'Error'
+
+    def segment_text(self, text: str) -> List[List[str]]:
+        """
+        텍스트 세그멘테이션의 편의 메서드
+        
+        Args:
+            text (str): 세그멘테이션할 텍스트
+            
+        Returns:
+            List[List[str]]: 세그멘테이션 결과
+        """
+        text = chunk_text(text, 120000)
+        return self.execute(
+            text=text,
+            post_process=False,
+            seg_cnt=-1,
+            alpha=0.0,
+            min_size=300,
+            max_size=1000
+        )
+    

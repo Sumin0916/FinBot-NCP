@@ -197,6 +197,7 @@ class RetrievalAugmentation:
 
         self.tree_retriever_config = config.tree_retriever_config
         self.qa_model = config.qa_model
+        self.clustering_algorithm = config.tree_builder_config.clustering_algorithm
 
         if self.tree is not None:
             self.retriever = TreeRetriever(self.tree_retriever_config, self.tree)
@@ -209,21 +210,61 @@ class RetrievalAugmentation:
 
     def add_documents(self, docs):
         """
-        Adds documents to the tree and creates a TreeRetriever instance.
-
+        입력 데이터와 토크나이저 타입에 따라 적절한 트리 생성 방법을 선택합니다.
+        
         Args:
-            docs (str): The input text to add to the tree.
+            docs (Union[str, dict, list]): 
+                - 일반 텍스트 문자열 또는
+                - FinQA 형식의 JSON 데이터 (dict 또는 list)
         """
+        logger = logging.getLogger(__name__)
+        
         if self.tree is not None:
             user_input = input(
                 "Warning: Overwriting existing tree. Did you mean to call 'add_to_existing' instead? (y/n): "
             )
             if user_input.lower() == "y":
-                # self.add_to_existing(docs)
                 return
 
-        self.tree = self.tree_builder.build_from_text(input_data=docs)
+        # FinRAG clustering 사용 여부 확인
+        is_using_finrag = self.clustering_algorithm == "FinRAG_Clustering"
+        logger.info(f"{self.clustering_algorithm}")
+
+        # 입력 데이터 타입 확인
+        is_finqa_data = isinstance(docs, list)
+        
+        # FinRAG clustering을 사용하면 무조건 FinQA 토크나이저를 사용해야 함
+        if is_finqa_data:
+            logger.info("FinRAG Clustering 감지: FinQA 토크나이저 사용")
+            try:
+                self.tree = self.tree_builder.build_from_finqa(input_data=docs)
+                logger.info("FinQA 데이터로 트리 생성 완료")
+            except Exception as e:
+                logger.error(f"FinQA 트리 생성 중 오류 발생: {str(e)}")
+                return None
+        
+        else:
+            # 기존 로직 유지
+            if not isinstance(docs, str):
+                try:
+                    docs = str(docs)
+                    logger.warning(f"입력 데이터({type(docs)})를 문자열로 변환했습니다.")
+                except:
+                    logger.error("입력 데이터를 문자열로 변환할 수 없습니다.")
+                    return None
+                    
+            logger.info("일반 텍스트 형식 감지: build_from_text 사용")
+            try:
+                self.tree = self.tree_builder.build_from_text(input_data=docs)
+                logger.info("텍스트 데이터로 트리 생성 완료")
+            except Exception as e:
+                logger.error(f"트리 생성 중 오류 발생: {str(e)}")
+                return None
+        
         self.retriever = TreeRetriever(self.tree_retriever_config, self.tree)
+        logger.info("TreeRetriever 초기화 완료")
+        
+        return self.tree
 
     def retrieve(
         self,

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Dict, List, Optional, Set, Tuple, Union
 
-import tqdm
+from tqdm import tqdm  # 이렇게 해야 함
 import openai
 import tiktoken
 from tenacity import retry, stop_after_attempt, wait_random_exponential
@@ -20,7 +20,7 @@ from .tree_structures import Node, Tree
 from .custom_tokenizer import FinQATokenizer
 from .utils import (distances_from_embeddings, get_children, get_embeddings,
                     get_node_list, get_text,
-                    indices_of_nearest_neighbors_from_distances, split_text)
+                    indices_of_nearest_neighbors_from_distances, split_text, fin_json_to_list)
 
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
 
@@ -190,19 +190,6 @@ class TreeBuilder:
         if children_indices is None:
             children_indices = set()
 
-        # # FinQA 토크나이저인 경우에만 메타데이터 딕셔너리 추가
-        # if isinstance(self.tokenizer, FinQATokenizer):
-        #     if not self.metadata_executor:
-        #         raise ValueError(
-        #         "FinQATokenizer need metadata_executor"
-        #     )
-        #     embeddings = {
-        #         model_name: model.create_embedding(text)
-        #         for model_name, model in self.embedding_models.items()
-        #     }
-        #     return (index, Node(text, index, children_indices, embeddings, meta_data))
-        
-        # 일반적인 경우는 원래 로직 그대로 사용
         embeddings = {
             model_name: model.create_embedding(text)
             for model_name, model in self.embedding_models.items()
@@ -288,85 +275,96 @@ class TreeBuilder:
 
         return leaf_nodes
 
-    def build_from_text(self, input_data: Union[str, dict, list], use_multithreading: bool = True) -> Tree:
-        """Builds a golden tree from the input text or JSON data, optionally using multithreading.
+    def build_from_finqa(self, input_data: list, use_multithreading: bool = True) -> Tree:
+        """FinQA JSON 데이터로부터 트리를 구축합니다.
         
         Args:
-            input_data (Union[str, dict]): The input text or JSON data.
-                - If using regular tokenizer: input should be str
-                - If using FinQATokenizer: input should be dict (JSON format)
-            use_multithreading (bool, optional): Whether to use multithreading when creating leaf nodes.
-                Default: True.
-        
+            json_data (list): FinQA 형식의 JSON 데이터
+            use_multithreading (bool): 멀티스레딩 사용 여부. 기본값: True
+            
         Returns:
-            Tree: The golden tree structure.
+            Tree: 구축된 트리 구조
         """
+        meta_chunks = fin_json_to_list(input_data, self.metadata_executor)
         
-        # 입력 타입과 토크나이저 타입에 따른 청크 생성
+        # 리프 노드 생성
+        leaf_nodes = {}
+        if use_multithreading:
+            with ThreadPoolExecutor() as executor:
+                future_nodes = {
+                    executor.submit(self.create_node, index, chunk_text, meta_data=chunk_meta): (index, chunk_text)
+                    for index, (chunk_meta, chunk_text) in enumerate(meta_chunks)
+                }
+                
+                with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
+                    for future in as_completed(future_nodes):
+                        index, node = future.result()
+                        leaf_nodes[index] = node
+                        pbar.update(1)
+        else:
+            for index, (chunk_meta, chunk_text) in tqdm(enumerate(meta_chunks),
+                                                    total=len(meta_chunks),
+                                                    desc="Creating nodes"):
+                __, node = self.create_node(index, chunk_text, meta_data=chunk_meta)
+                leaf_nodes[index] = node
+                
+        return self._construct_final_tree(leaf_nodes)
+
+    def build_from_text(self, text: str, use_multithreading: bool = True) -> Tree:
+        """일반 텍스트로부터 트리를 구축합니다.
+        
+        Args:
+            text (str): 입력 텍스트
+            use_multithreading (bool): 멀티스레딩 사용 여부. 기본값: True
+            
+        Returns:
+            Tree: 구축된 트리 구조
+        """
         if isinstance(self.tokenizer, FinQATokenizer):
-            if not (isinstance(input_data, dict) or isinstance(input_data, list)):
-                raise ValueError("When using FinQATokenizer, input_data must be a dictionary")
-            meta_chunks = self.tokenizer.encode(input_data)  # (dict, str) 형식의 리스트 반환
+            raise ValueError("일반 텍스트에는 FinQATokenizer를 사용할 수 없습니다.")
             
-            if use_multithreading:
-                leaf_nodes = {}
-                with ThreadPoolExecutor() as executor:
-                    future_nodes = {
-                        executor.submit(self.create_node, index, chunk_text, meta_data=chunk_meta): (index, chunk_text)
-                        for index, (chunk_meta, chunk_text) in enumerate(meta_chunks)
-                    }
-                    
-                    # tqdm으로 진행상황 표시
-                    with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
-                        for future in as_completed(future_nodes):
-                            index, node = future.result()
-                            leaf_nodes[index] = node
-                            pbar.update(1)
-            else:
-                leaf_nodes = {}
-                # tqdm으로 진행상황 표시
-                for index, (chunk_meta, chunk_text) in tqdm(enumerate(meta_chunks), 
-                                                        total=len(meta_chunks),
-                                                        desc="Creating nodes"):
-                    __, node = self.create_node(index, chunk_text, meta_data=chunk_meta)
-                    leaf_nodes[index] = node
+        chunks = split_text(text, self.tokenizer, self.max_tokens)
         
-        else:  # 일반 토크나이저 사용시
-            if not isinstance(input_data, str):
-                raise ValueError("When using regular tokenizer, input_data must be a string")
-            chunks = split_text(input_data, self.tokenizer, self.max_tokens)
+        # 리프 노드 생성
+        leaf_nodes = {}
+        if use_multithreading:
+            with ThreadPoolExecutor() as executor:
+                future_nodes = {
+                    executor.submit(self.create_node, index, text): (index, text)
+                    for index, text in enumerate(chunks)
+                }
+                
+                with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
+                    for future in as_completed(future_nodes):
+                        index, node = future.result()
+                        leaf_nodes[index] = node
+                        pbar.update(1)
+        else:
+            for index, text in tqdm(enumerate(chunks),
+                                total=len(chunks),
+                                desc="Creating nodes"):
+                __, node = self.create_node(index, text)
+                leaf_nodes[index] = node
+                
+        return self._construct_final_tree(leaf_nodes)
+
+    def _construct_final_tree(self, leaf_nodes: Dict[int, Node]) -> Tree:
+        """최종 트리 구조를 구축하는 헬퍼 함수
+        
+        Args:
+            leaf_nodes (Dict[int, Node]): 리프 노드들의 딕셔너리
             
-            if use_multithreading:
-                leaf_nodes = {}
-                with ThreadPoolExecutor() as executor:
-                    future_nodes = {
-                        executor.submit(self.create_node, index, text): (index, text)
-                        for index, text in enumerate(chunks)
-                    }
-                    
-                    # tqdm으로 진행상황 표시
-                    with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
-                        for future in as_completed(future_nodes):
-                            index, node = future.result()
-                            leaf_nodes[index] = node
-                            pbar.update(1)
-            else:
-                leaf_nodes = {}
-                # tqdm으로 진행상황 표시
-                for index, text in tqdm(enumerate(chunks), 
-                                    total=len(chunks),
-                                    desc="Creating nodes"):
-                    __, node = self.create_node(index, text)
-                    leaf_nodes[index] = node
-    
+        Returns:
+            Tree: 구축된 트리 구조
+        """
         layer_to_nodes = {0: list(leaf_nodes.values())}
         logging.info(f"Created {len(leaf_nodes)} Leaf Embeddings")
         logging.info("Building All Nodes")
-
+        
         all_nodes = copy.deepcopy(leaf_nodes)
         root_nodes = self.construct_tree(all_nodes, all_nodes, layer_to_nodes)
         tree = Tree(all_nodes, root_nodes, leaf_nodes, self.num_layers, layer_to_nodes)
-
+        
         return tree
     
     @abstractclassmethod

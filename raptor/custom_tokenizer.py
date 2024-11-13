@@ -1,7 +1,8 @@
 from typing import List, Tuple, Dict, Union
-from .ExtractModel import HCX_003_MetaDataExecutor
 import re
 import raptor.config as config
+
+from .utils import fin_json_to_list
 
 class FinQATokenizer:
     """
@@ -13,39 +14,6 @@ class FinQATokenizer:
     def __init__(self, chunk_size: int = 1024):
         self.chunk_size = chunk_size  # byte 단위
         self.row_template = "{} 항목의 {} 값은 {} 입니다;"  # 한글 템플릿으로 변경
-        self.metadata_executor = HCX_003_MetaDataExecutor()
-    
-    def _preprocess_text(self, json_data: dict) -> str:
-        """
-        pre_text, table, post_text를 하나의 문서로 통합하고 전처리
-        Dict -> Str
-        """
-        document_parts = []
-        
-        # Pre-text 처리
-        if 'pre_text' in json_data and json_data['pre_text']:
-            pre_text = ' '.join([text.strip() for text in json_data['pre_text'] if text.strip()])
-            if pre_text:
-                document_parts.append(pre_text)
-        
-        # Table 처리
-        if 'table_ori' in json_data and json_data['table_ori']:
-            table_text = self._table_to_text(json_data['table_ori'])
-            if table_text:
-                document_parts.append(table_text)
-        
-        # Post-text 처리
-        if 'post_text' in json_data and json_data['post_text']:
-            post_text = ' '.join([text.strip() for text in json_data['post_text'] if text.strip()])
-            if post_text:
-                document_parts.append(post_text)
-        
-        # 전체 문서 통합
-        full_document = '\n\n'.join(document_parts)
-        
-        # 기본적인 텍스트 정제
-        cleaned_text = self._clean_text(full_document)
-        return cleaned_text
     
     def _clean_text(self, text: str) -> str:
         """
@@ -260,73 +228,15 @@ class FinQATokenizer:
         
         return chunks
 
-    def encode(self, json_data: Union[List[dict], dict]) -> List[Tuple[Dict, str]]:
+    def encode(self, json_data):
         """
         FinQA JSON 데이터를 (메타데이터, 토큰화된 문장) 튜플 리스트로 변환
-        - 테이블의 각 행을 개별 청크로 처리
-        """
-        # 단일 딕셔너리인 경우 리스트로 변환
-        if isinstance(json_data, dict):
-            json_data = [json_data]
-        
-        result = []
-        metadata = None
+        - 각 문서별 메타데이터 처리
+        - 필수 메타데이터(companyName, sector, year) 없으면 LLM으로 추출
 
-        # 메타데이터 처리 (이전과 동일)
-        combined_text = ""
-        for doc in json_data:
-            if "metadata" in doc:
-                metadata = doc["metadata"]
-                break
-            else:
-                preprocessed_text = self._preprocess_text(doc)
-                if preprocessed_text:
-                    combined_text += preprocessed_text + "\n\n"
-        
-        if metadata is None and combined_text:
-            metadata_result = self.metadata_executor.extract_metadata(combined_text)
-            if metadata_result.get('success'):
-                metadata = metadata_result
-            else:
-                metadata = {
-                    "companyName": "UNK",
-                    "ticker": "UNK",
-                    "sector": "UNK",
-                    "year": "UNK",
-                    "issue_d": "UNK",
-                    "quarter": "UNK",
-                    "market": "UNK",
-                    "country": "UNK",
-                }
-            
-        for document in json_data:
-            # Pre-text 청킹 및 처리 (이전과 동일)
-            if 'pre_text' in document and document['pre_text']:
-                pre_text_chunks = self._chunk_text(
-                    [text for text in document['pre_text'] if text.strip()]
-                )
-                for chunk in pre_text_chunks:
-                    chunk_metadata = {**metadata, "section": "pre_text"}
-                    result.append((chunk_metadata, chunk))
-            
-            # 표 처리 - 각 행을 독립적인 청크로 처리
-            if 'table_ori' in document and document['table_ori']:
-                table_sentences = self._table_to_text(document['table_ori'])
-                for row_sentence in table_sentences:
-                    if row_sentence.strip():  # 빈 문장 제외
-                        chunk_metadata = {**metadata, "section": "table"}
-                        result.append((chunk_metadata, row_sentence))
-            
-            # Post-text 청킹 및 처리 (이전과 동일)
-            if 'post_text' in document and document['post_text']:
-                post_text_chunks = self._chunk_text(
-                    [text for text in document['post_text'] if text.strip()]
-                )
-                for chunk in post_text_chunks:
-                    chunk_metadata = {**metadata, "section": "post_text"}
-                    result.append((chunk_metadata, chunk))
-        
-        return result
+        하나의 문서 -> 리스트로
+        """
+        return json_data
 
     def decode(self, token_pairs: List[Tuple[Dict, str]]) -> List[Tuple[Dict, str]]:
         """
