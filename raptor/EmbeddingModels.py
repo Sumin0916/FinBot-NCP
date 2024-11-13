@@ -54,46 +54,15 @@ class HyperCLOVAEmbeddingModel(BaseEmbeddingModel):
         self.request_id = EMBEDDING_CONFIG['request_id']
         self.endpoint = EMBEDDING_CONFIG['endpoint']
         self.last_request_time = 0
-        self.min_request_interval = 1  # 최소 요청 간격 (초)
-
-    def _check_rate_limits(self, response):
-        """응답 헤더에서 rate limit 정보를 확인하고 처리"""
-        headers = response.getheaders()
-        rate_limits = {}
-        
-        for key, value in headers:
-            if key.startswith('x-ratelimit-'):
-                rate_limits[key] = value
-        
-        remaining_requests = int(rate_limits.get('x-ratelimit-remaining-requests', 0))
-        remaining_tokens = int(rate_limits.get('x-ratelimit-remaining-tokens', 0))
-        reset_requests = rate_limits.get('x-ratelimit-reset-requests', '0s').replace('s', '')
-        reset_tokens = rate_limits.get('x-ratelimit-reset-tokens', '0s').replace('s', '')
-        
-        # 로깅을 통한 모니터링
-        logging.info(f"Rate Limits - Remaining Requests: {remaining_requests}, "
-                    f"Remaining Tokens: {remaining_tokens}, "
-                    f"Reset Requests in: {reset_requests}s, "
-                    f"Reset Tokens in: {reset_tokens}s")
-        
-        return remaining_requests, remaining_tokens, float(reset_requests), float(reset_tokens)
-
-    def _wait_if_needed(self, remaining_requests, remaining_tokens, reset_requests, reset_tokens):
-        """rate limit에 따른 대기 시간 계산 및 적용"""
-        current_time = time.time()
-        elapsed = current_time - self.last_request_time
-        
-        if remaining_requests <= 1 or remaining_tokens <= 1:
-            wait_time = max(float(reset_requests), float(reset_tokens))
-            logging.warning(f"Rate limit near threshold. Waiting for {wait_time} seconds.")
-            time.sleep(wait_time + 0.1)  # 여유를 두고 대기
-        elif elapsed < self.min_request_interval:
-            wait_time = self.min_request_interval - elapsed
-            time.sleep(wait_time)
-        
-        self.last_request_time = time.time()
 
     def _send_request(self, text):
+        # 1초 간격 유지
+        current_time = time.time()
+        elapsed = current_time - self.last_request_time
+        if elapsed < 1:
+            time.sleep(1 - elapsed)
+        self.last_request_time = time.time()
+
         headers = {
             'Content-Type': 'application/json; charset=utf-8',
             'X-NCP-CLOVASTUDIO-API-KEY': self.api_key,
@@ -114,11 +83,6 @@ class HyperCLOVAEmbeddingModel(BaseEmbeddingModel):
         )
         
         response = conn.getresponse()
-        
-        # rate limit 체크 및 처리
-        remaining_requests, remaining_tokens, reset_requests, reset_tokens = self._check_rate_limits(response)
-        self._wait_if_needed(remaining_requests, remaining_tokens, reset_requests, reset_tokens)
-        
         result = json.loads(response.read().decode(encoding='utf-8'))
         conn.close()
         return result
@@ -139,7 +103,4 @@ class HyperCLOVAEmbeddingModel(BaseEmbeddingModel):
                 
         except Exception as e:
             logging.error(f"Exception in HyperCLOVA embedding creation: {e}")
-            if "429" in str(e):  # Rate limit exceeded
-                logging.warning("Rate limit exceeded. Implementing exponential backoff...")
-                raise  # retry decorator will handle this
             raise e
