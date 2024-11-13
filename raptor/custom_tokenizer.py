@@ -1,7 +1,7 @@
 from typing import List, Tuple, Dict, Union
 from .ExtractModel import HCX_003_MetaDataExecutor
 import re
-import raptor.config as config
+import raptor.config.api_config as api_config
 
 class FinQATokenizer:
     """

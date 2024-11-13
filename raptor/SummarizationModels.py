@@ -7,7 +7,7 @@ import requests
 
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
-from .config import (
+from .config.api_config import (
     CLOVA_HOST, 
     CLOVA_API_KEY, 
     CLOVA_API_GATEWAY_KEY, 
