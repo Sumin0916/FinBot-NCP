@@ -1,6 +1,6 @@
 from typing import List, Tuple, Dict, Union
 import re
-import raptor.config as config
+import raptor.config.api_config as api_config
 
 from .utils import fin_json_to_list
 

@@ -5,7 +5,7 @@ import requests
 import http.client
 
 from tenacity import retry, wait_random_exponential, stop_after_attempt
-from .config import (
+from .config.api_config import (
     CLOVA_HOST, 
     CLOVA_API_KEY, 
     CLOVA_API_GATEWAY_KEY, 

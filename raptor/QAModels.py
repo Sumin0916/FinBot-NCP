@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 import torch
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 from transformers import T5ForConditionalGeneration, T5Tokenizer
-from .config import (
+from .config.api_config import (
     CLOVA_HOST, 
     CLOVA_API_KEY, 
     CLOVA_API_GATEWAY_KEY, 
