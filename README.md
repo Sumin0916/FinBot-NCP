@@ -1,8 +1,8 @@
 # FinBot-NCP
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/finbot-dark.png">
-  <img alt="FinBot NCP Logo" src="assets/finbot-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="./img/naver_cloud.png">
+  <img alt="NC Logo" src="./img/naver_cloud.png">
 </picture>
 
 2024 NAVER Cloud Platform Capstone Project. An AI-powered chatbot built on NCP services that analyzes financial statements and provides insights through natural language interactions.
