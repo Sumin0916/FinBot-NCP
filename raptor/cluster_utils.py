@@ -191,68 +191,40 @@ class FinRAG_Clustering(ClusteringAlgorithm):
         nodes: List[Node],
         embedding_model_name: str,
         layer: int = 0,
-        max_length_in_cluster: int = 3500,
-        tokenizer=tiktoken.get_encoding("cl100k_base"),
         **kwargs
     ) -> List[List[Node]]:
-        """
-        메타데이터 기반 계층적 클러스터링 수행
         
-        Args:
-            nodes: 클러스터링할 노드 리스트
-            embedding_model_name: 임베딩 모델 이름
-            layer: 현재 트리 레이어 (클러스터링 전략 결정에 사용)
-            max_length_in_cluster: 클러스터당 최대 텍스트 길이
-            tokenizer: 토크나이저 -> 클러스터 내 모든 텍스트의 총 토큰 길이 계산을 위해 (encode 매소드만 사용함)
-        """
-        def cluster_by_metadata(nodes: List[Node], keys: List[str]) -> List[List[Node]]:
-            clusters = defaultdict(list)
+        def group_by_metadata(nodes: List[Node], metadata_keys: List[str]) -> List[List[Node]]:
+            groups = defaultdict(list)
             
             for node in nodes:
-                if not node.metadata:
-                    continue
-                    
-                # 메타데이터 키 조합으로 클러스터 키 생성
-                cluster_key = tuple(node.metadata.get(k, '') for k in keys)
-                clusters[cluster_key].append(node)
-            
-            # 너무 큰 클러스터는 GMM으로 추가 분할
-            result_clusters = []
-            for cluster in clusters.values():
-                total_length = sum(len(tokenizer.encode(node.text)) for node in cluster)
+                # 메타데이터 키 조합으로 그룹화
+                group_key = tuple(node.metadata.get(k, '') for k in metadata_keys)
+                groups[group_key].append(node)
                 
-                if total_length > max_length_in_cluster and len(cluster) > 1:
-                    # GMM 클러스터링으로 추가 분할
-                    embeddings = np.array([node.embeddings[embedding_model_name] for node in cluster])
-                    subclusters = RAPTOR_Clustering.perform_clustering(
-                        cluster, 
-                        embedding_model_name,
-                        max_length_in_cluster
-                    )
-                    result_clusters.extend(subclusters)
-                else:
-                    result_clusters.append(cluster)
-                    
-            return result_clusters
+            return list(groups.values())
+
+        # 레이어별 요약 길이 설정
+        summary_lengths = {
+            0: 300,  # Document -> Year clusters
+            1: 200,  # Year -> Company clusters  
+            2: 100,  # Company -> Sector clusters
+            3: 1000  # Sector -> Final summary
+        }
 
         # 레이어별 클러스터링 전략
-        if layer == 0:  # Layer 0 -> Layer 1: 섹터/회사/연도
-            return cluster_by_metadata(nodes, ['sector', 'company', 'year'])
+        if layer == 0:
+            # Documents -> Year clusters (300 tokens)
+            return group_by_metadata(nodes, ['year'])
             
-        elif layer == 1:  # Layer 1 -> Layer 2: 섹터/회사
-            return cluster_by_metadata(nodes, ['sector', 'company'])
+        elif layer == 1:  
+            # Year -> Company clusters (200 tokens)
+            return group_by_metadata(nodes, ['company'])
             
-        elif layer == 2:  # Layer 2 -> Layer 3: 섹터
-            return cluster_by_metadata(nodes, ['sector'])
+        elif layer == 2:
+            # Company -> Sector clusters (100 tokens) 
+            return group_by_metadata(nodes, ['sector'])
             
-        else:  # Layer 3 -> Layer 4: 전체 통합
-            total_length = sum(len(tokenizer.encode(node.text)) for node in nodes)
-            
-            if total_length > max_length_in_cluster and len(nodes) > 1:
-                # 너무 큰 경우 GMM으로 분할
-                return RAPTOR_Clustering.perform_clustering( # 이 부분이 하이브리드 방법 적용한건데 아직 고민중
-                    nodes,
-                    embedding_model_name,
-                    max_length_in_cluster
-                )
+        else:
+            # Final layer - combine all sectors (1000 tokens)
             return [nodes]

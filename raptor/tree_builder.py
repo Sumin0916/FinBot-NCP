@@ -7,7 +7,8 @@ from threading import Lock
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 from tqdm import tqdm  # 이렇게 해야 함
-import openai
+from openai import BadRequestError, RateLimitError
+import time
 import tiktoken
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
@@ -20,7 +21,7 @@ from .tree_structures import Node, Tree
 from .custom_tokenizer import FinQATokenizer
 from .utils import (distances_from_embeddings, get_children, get_embeddings,
                     get_node_list, get_text,
-                    indices_of_nearest_neighbors_from_distances, split_text, fin_json_to_list)
+                    indices_of_nearest_neighbors_from_distances, split_text, chunk_financial_data)
 
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
 
@@ -174,7 +175,7 @@ class TreeBuilder:
         index: int, 
         text: str, 
         children_indices: Optional[Set[int]] = None,
-        meta_data: Dict = None
+        metadata: Dict = None
     ) -> Tuple[int, Node]:
         """Creates a new node with the given index, text, and (optionally) children indices.
 
@@ -194,7 +195,7 @@ class TreeBuilder:
             model_name: model.create_embedding(text)
             for model_name, model in self.embedding_models.items()
         }
-        return (index, Node(text, index, children_indices, embeddings))
+        return (index, Node(text, index, children_indices, embeddings, metadata=metadata))
 
     def create_embedding(self, text) -> List[float]:
         """
@@ -276,77 +277,120 @@ class TreeBuilder:
         return leaf_nodes
 
     def build_from_finqa(self, input_data: list, use_multithreading: bool = True) -> Tree:
-        """FinQA JSON 데이터로부터 트리를 구축합니다.
+        """FinQA JSON 데이터로부터 트리를 구축합니다."""
+        logger = logging.getLogger(__name__)
         
-        Args:
-            json_data (list): FinQA 형식의 JSON 데이터
-            use_multithreading (bool): 멀티스레딩 사용 여부. 기본값: True
-            
-        Returns:
-            Tree: 구축된 트리 구조
-        """
-        meta_chunks = fin_json_to_list(input_data, self.metadata_executor)
+        try:
+            meta_chunks = chunk_financial_data(input_data)
+            logger.info("FinQA 데이터 청킹 완료")
+
+            # 디버깅을 위한 청크 정보 저장
+            self.debug_chunks = {
+                i: {'meta': chunk_meta, 'text': chunk_text}
+                for i, (chunk_meta, chunk_text) in enumerate(meta_chunks)
+            }
+        except Exception as e:
+            logger.error(f"FinQA 데이터 청킹 오류 발생: {str(e)}")
+            raise
         
         # 리프 노드 생성
         leaf_nodes = {}
+        failed_chunks = []
+        
         if use_multithreading:
-            with ThreadPoolExecutor() as executor:
+            # 동시 실행 스레드 수 제한
+            max_workers = min(5, len(meta_chunks))
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_nodes = {
-                    executor.submit(self.create_node, index, chunk_text, meta_data=chunk_meta): (index, chunk_text)
+                    executor.submit(
+                        self._safe_create_node,
+                        index,
+                        chunk_text,
+                        chunk_meta
+                    ): (index, chunk_text)
                     for index, (chunk_meta, chunk_text) in enumerate(meta_chunks)
                 }
                 
-                with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
+                with tqdm(total=len(meta_chunks), desc="Creating nodes") as pbar:
                     for future in as_completed(future_nodes):
-                        index, node = future.result()
-                        leaf_nodes[index] = node
-                        pbar.update(1)
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                index, node = result
+                                leaf_nodes[index] = node
+                            else:
+                                # 실패한 청크 기록
+                                failed_index, _ = future_nodes[future]
+                                failed_chunks.append(failed_index)
+                            pbar.update(1)
+                        except Exception as e:
+                            logger.error(f"Node creation failed: {str(e)}")
+                            failed_index, _ = future_nodes[future]
+                            failed_chunks.append(failed_index)
+                            pbar.update(1)
         else:
-            for index, (chunk_meta, chunk_text) in tqdm(enumerate(meta_chunks),
-                                                    total=len(meta_chunks),
-                                                    desc="Creating nodes"):
-                __, node = self.create_node(index, chunk_text, meta_data=chunk_meta)
-                leaf_nodes[index] = node
-                
+            for index, (chunk_meta, chunk_text) in tqdm(
+                enumerate(meta_chunks),
+                total=len(meta_chunks),
+                desc="Creating nodes"
+            ):
+                try:
+                    result = self._safe_create_node(index, chunk_text, chunk_meta)
+                    if result is not None:
+                        __, node = result
+                        leaf_nodes[index] = node
+                    else:
+                        failed_chunks.append(index)
+                except Exception as e:
+                    logger.error(f"Node creation failed: {str(e)}")
+                    failed_chunks.append(index)
+        
+        # 실패한 청크 디버그 정보 출력 및 재시도
+        if failed_chunks:
+            logger.warning(f"\n{'='*50}\n실패한 청크 상세 정보:")
+            for chunk_idx in failed_chunks:
+                chunk_info = self.debug_chunks.get(chunk_idx, {})
+                logger.warning(f"\nChunk {chunk_idx}:")
+                logger.warning(f"Text: {chunk_info.get('text', 'N/A')[:200]}...")
+                logger.warning(f"Metadata: {chunk_info.get('meta', 'N/A')}")
+                logger.warning(f"Text length: {len(chunk_info.get('text', ''))}")
+                logger.warning(f"Special chars: {[c for c in chunk_info.get('text', '') if not c.isalnum() and not c.isspace()][:10]}")
+            
+            logger.warning(f"Retrying {len(failed_chunks)} failed chunks...")
+            for index in failed_chunks:
+                chunk_meta, chunk_text = meta_chunks[index]
+                try:
+                    time.sleep(1)  # Rate limit 방지를 위한 대기
+                    result = self._safe_create_node(index, chunk_text, chunk_meta)
+                    if result is not None:
+                        __, node = result
+                        leaf_nodes[index] = node
+                except Exception as e:
+                    logger.error(f"Retry failed for chunk {index}: {str(e)}")
+        
+        if not leaf_nodes:
+            raise ValueError("모든 노드 생성이 실패했습니다.")
+        
         return self._construct_final_tree(leaf_nodes)
 
-    def build_from_text(self, text: str, use_multithreading: bool = True) -> Tree:
-        """일반 텍스트로부터 트리를 구축합니다.
+    def _safe_create_node(self, index, text, metadata):
+        """에러 처리가 포함된 노드 생성 래퍼 메소드"""
+        logger = logging.getLogger(__name__)
+        max_retries = 3
+        retry_delay = 2
         
-        Args:
-            text (str): 입력 텍스트
-            use_multithreading (bool): 멀티스레딩 사용 여부. 기본값: True
-            
-        Returns:
-            Tree: 구축된 트리 구조
-        """
-        if isinstance(self.tokenizer, FinQATokenizer):
-            raise ValueError("일반 텍스트에는 FinQATokenizer를 사용할 수 없습니다.")
-            
-        chunks = split_text(text, self.tokenizer, self.max_tokens)
-        
-        # 리프 노드 생성
-        leaf_nodes = {}
-        if use_multithreading:
-            with ThreadPoolExecutor() as executor:
-                future_nodes = {
-                    executor.submit(self.create_node, index, text): (index, text)
-                    for index, text in enumerate(chunks)
-                }
-                
-                with tqdm(total=len(future_nodes), desc="Creating nodes (multithreaded)") as pbar:
-                    for future in as_completed(future_nodes):
-                        index, node = future.result()
-                        leaf_nodes[index] = node
-                        pbar.update(1)
-        else:
-            for index, text in tqdm(enumerate(chunks),
-                                total=len(chunks),
-                                desc="Creating nodes"):
-                __, node = self.create_node(index, text)
-                leaf_nodes[index] = node
-                
-        return self._construct_final_tree(leaf_nodes)
+        for attempt in range(max_retries):
+            try:
+                return self.create_node(index, text, metadata=metadata)
+            except (BadRequestError, RateLimitError) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))  # 지수 백오프
+                    continue
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected error creating node: {str(e)}")
+                return None
 
     def _construct_final_tree(self, leaf_nodes: Dict[int, Node]) -> Tree:
         """최종 트리 구조를 구축하는 헬퍼 함수

@@ -179,78 +179,50 @@ class HCX_003_SummarizationModel(BaseSummarizationModel):
 
     def _prepare_messages(self, context):
         """프롬프트 메시지 준비"""
-        return [
+        prompts = [
             {
-            "role": "system",
-            "content": """당신은 20년 경력의 재무분석 전문가입니다. 주어진 재무제표를 다음 구조로 체계적으로 분석하여 요약해주세요:
+                "role": "system",
+                "content": """
+                    당신은 재무 데이터 분석 전문가입니다.
+                    주어진 재무 데이터를 아래 지침에 따라 종합적으로 요약해주세요.
 
-            1. 핵심 요약 (Executive Summary)
-            - 가장 중요한 3-4개의 핵심 포인트
-            - 전체 맥락에서 특별히 주목해야 할 변화나 트렌드
+                    지시사항:
+                    1. 모든 테이블과 텍스트 데이터를 꼼꼼히 분석
+                    2. 데이터간 연관성을 찾아 맥락을 구성
+                    3. 중요한 수치와 키워드는 반드시 포함
+                    4. 시간 순서나 중요도 순서로 구성
+                    5. 객관적 사실을 기반으로 서술
+                    6. 필요한 경우 데이터의 의미나 영향도 설명
 
-            2. 주요 수치 분석 (Key Metrics)
-            - 매출/이익 지표 
-            - 재무상태 지표
-            - 주요 재무비율
-            - 전년 대비 주요 변동사항
+                    출력 형식:
+                    [Overview]
+                    - 전반적인 재무 상황 개요
+                    - 주목할 만한 주요 변화나 특징
+                    - 핵심 지표들의 전반적인 흐름
 
-            3. 세부 인사이트 (Detailed Insights)
-            - 수익성 관련 주요 발견점
-            - 재무안정성 관련 중요 사항
-            - 현금흐름 관련 핵심 사항
-            - 예외적/특이사항
+                    [Detailed Analysis]
+                    - 테이블 데이터 분석
+                    - 주요 수치와 그 의미
+                    - 시계열적 변화와 패턴
+                    - 항목간 관계성
 
-            4. 기업 및 산업 분석
-            - 계정과목 구성 기반 기업 특성 파악
-            - 자산/부채 구조 기반 산업 특성 분석
-            - 매출/이익 패턴 기반 사업 모델 추정
+                    - 텍스트 데이터 분석
+                    - 주요 설명과 논점
+                    - 중요 키워드와 그 맥락
+                    - 특이사항이나 예외적 내용
 
-            출력 형식:
-            {
-            \"분석결과\": {
-                \"핵심요약\": {
-                \"주요포인트\": [...],
-                \"주요트렌드\": [...]
-                },
-                \"주요지표\": {
-                \"매출이익\": {...},
-                \"재무상태\": {...},
-                \"주요비율\": {...}
-                },
-                \"세부인사이트\": {
-                \"수익성\": \"...\",
-                \"안정성\": \"...\",
-                \"현금흐름\": \"...\",
-                \"특이사항\": \"...\"
-                },
-                \"기업분석\": {
-                \"추정기업명\": \"...\",
-                \"신뢰도\": \"(상/중/하)\",
-                \"추정근거\": \"...\"
-                },
-                \"산업분석\": {
-                \"추정산업\": \"...\",
-                \"신뢰도\": \"(상/중/하)\",
-                \"추정근거\": \"...\"
-                }
-            }
-            }
-
-            주요 가이드라인:
-            - 모든 금액은 천원/백만원 단위 사용 (천단위 구분자 포함)
-            - 비율은 소수점 1자리까지 표시 (예: 23.4%)
-            - 증감은 상대값과 절대값 모두 표시 (예: +12.3%, +1.2억원)
-            - 중요도에 따라 정보 구조화
-            - 모든 판단은 객관적 데이터에 근거
-            - 추정의 불확실성은 명확히 표시
-            - 일회성/경상성 항목 구분하여 설명
-            - 산업 특성 반영한 해석 제공"""
+                    [Key Insights]
+                    - 발견된 주요 인사이트
+                    - 데이터가 시사하는 의미
+                    - 주목해야 할 특이사항
+                    """
             },
             {
                 "role": "user",
-                "content": f"가능한 많은 주요 정보를 포함하여 다음 요약을 작성하시오: {context}"
+                "content": f"다음 재무 데이터를 종합적으로 분석하여 요약해주세요. 테이블과 텍스트의 모든 중요 정보를 포함해주시고, 데이터간 연관성을 찾아 의미 있는 맥락을 구성해주세요: {context}"
             }
         ]
+        return prompts
 
     def _prepare_request_data(self, context, max_tokens):
         """요청 데이터 준비"""
@@ -266,6 +238,41 @@ class HCX_003_SummarizationModel(BaseSummarizationModel):
             'seed': 0
         }
 
+    def _parse_sse_line(self, line: str) -> str:
+        """SSE 라인 파싱 함수"""
+        if not line:
+            return ""
+            
+        try:
+            # 'data: ' 접두어 확인 및 제거
+            if line.startswith('data: '):
+                line = line[6:]
+            
+            # [DONE] 메시지 처리    
+            if line.strip() == '[DONE]':
+                return ""
+                
+            # JSON 파싱
+            data = json.loads(line)
+            
+            # 에러 체크
+            if 'error' in data:
+                self.logger.error(f"Error in response: {data['error']}")
+                raise Exception(data['error'])
+                
+            # 메시지 추출
+            if 'message' in data:
+                return data['message'].get('content', '')
+            
+            return data.get('text', '')
+            
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON 파싱 오류: {str(e)}, 라인: {line}")
+            return ""
+        except Exception as e:
+            self.logger.error(f"파싱 중 오류 발생: {str(e)}, 라인: {line}")
+            return ""
+
     def _send_request(self, request_data):
         """스트리밍 API 요청 전송"""
         headers = {
@@ -276,37 +283,30 @@ class HCX_003_SummarizationModel(BaseSummarizationModel):
             'Accept': 'text/event-stream'
         }
 
-        response_text = ""
+        full_response = []
         try:
             with requests.post(
-                f"{self.host}{self.endpoint}",
+                f"https://{self.host}{self.endpoint}",
                 headers=headers,
                 json=request_data,
                 stream=True
             ) as response:
                 response.raise_for_status()
+                
                 for line in response.iter_lines():
                     if line:
-                        # JSON 응답 파싱 및 텍스트 누적
                         decoded_line = line.decode('utf-8')
-                        response_text += self._parse_stream_response(decoded_line)
+                        content = self._parse_sse_line(decoded_line)
                         
-            return response_text.strip()
+                        if content:
+                            print(content, end='', flush=True)  # 실시간 출력
+                            full_response.append(content)
+                            
+            return ''.join(full_response).strip()
+            
         except requests.exceptions.RequestException as e:
-            logging.error(f"API request failed: {str(e)}")
+            self.logger.error(f"API request failed: {str(e)}")
             raise
-
-    def _parse_stream_response(self, line):
-        """스트리밍 응답 파싱"""
-        try:
-            data = json.loads(line)
-            if 'error' in data:
-                logging.error(f"Error in response: {data['error']}")
-                raise Exception(data['error'])
-            return data.get('text', '')
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse response: {str(e)}")
-            return ''
 
     @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
     def summarize(self, context, max_tokens=100, stop_sequence=None):
@@ -321,18 +321,25 @@ class HCX_003_SummarizationModel(BaseSummarizationModel):
         """
         try:
             # 입력 길이 검증
-            input_length = len(context)
-            if input_length > 35000:
-                error_msg = f"Input text too long: {input_length} chars (Max: 35000)"
-                logging.error(error_msg)
-                return error_msg
+            input_length = len(str(context))
+            MAX_CHAR_LENGTH = 20000
+            
+            if input_length > MAX_CHAR_LENGTH:
+                self.logger.info(f"Input text too long: {input_length} chars (Max: {MAX_CHAR_LENGTH})")
+                max_len = min(int(input_length * 0.8), int(MAX_CHAR_LENGTH * 0.8))
+                context = str(context)[:max_len]
+                self.logger.info(f"{max_len}자로 줄여서 요약을 진행합니다")
 
             # 요청 데이터 준비 및 전송
             request_data = self._prepare_request_data(context, max_tokens)
             summary = self._send_request(request_data)
 
+            # 빈 응답 체크
+            if not summary:
+                raise ValueError("요약 결과가 비어있습니다")
+
             # 결과 로깅
-            logging.info(
+            self.logger.info(
                 f"HyperCLOVA X 003 Summarization - "
                 f"Input length: {input_length} chars, "
                 f"Output length: {len(summary)} chars"
@@ -341,5 +348,5 @@ class HCX_003_SummarizationModel(BaseSummarizationModel):
             return summary
 
         except Exception as e:
-            logging.error(f"Summarization failed: {str(e)}")
-            return str(e)
+            self.logger.error(f"Summarization failed: {str(e)}")
+            raise

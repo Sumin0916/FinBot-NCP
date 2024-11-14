@@ -1,13 +1,15 @@
 import logging
 import re
 from typing import Dict, List, Set, Union, Tuple, Any
-
+from itertools import chain
+import html
 import numpy as np
 import tiktoken
 from scipy import spatial
 
 from .tree_structures import Node
 from .ExtractModel import HCX_003_MetaDataExecutor, CLOVASegmentationExecutor
+from .config.api_config import OPENAI_EMBEDDING_MAX_TOKENS
 
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
 
@@ -35,6 +37,7 @@ def split_text(
     Returns:
         List[str]: A list of text chunks.
     """
+    logger.info("이게 사용되었다~!")
     # Split the text into sentences using multiple delimiters
     delimiters = [".", "!", "?", "\n"]
     regex_pattern = "|".join(map(re.escape, delimiters))
@@ -179,7 +182,7 @@ def get_children(node_list: List[Node]) -> List[Set[int]]:
     return [node.children for node in node_list]
 
 
-def get_text(node_list: List[Node]) -> str:
+def get_text(node_list: List) -> str:
     """
     Generates a single text string by concatenating the text from a list of nodes.
 
@@ -191,6 +194,8 @@ def get_text(node_list: List[Node]) -> str:
     """
     text = ""
     for node in node_list:
+        if isinstance(node, tuple):
+            node = node[1]
         text += f"{' '.join(node.text.splitlines())}"
         text += "\n\n"
     return text
@@ -208,220 +213,128 @@ def indices_of_nearest_neighbors_from_distances(distances: List[float]) -> np.nd
     """
     return np.argsort(distances)
 
-def clean_text(text: str) -> str:
-    """
-    텍스트 정제를 위한 기본적인 전처리
-    """
-    # 연속된 공백 제거
-    text = re.sub(r'\s+', ' ', text)
-    # 불필요한 특수문자 제거 또는 변환
-    text = re.sub(r'[\u200b\ufeff\xa0]', ' ', text)
-    # 줄바꿈 표준화
-    text = re.sub(r'\r\n?', '\n', text)
-    # 빈 줄 최소화
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    return text.strip()
 
-def split_into_sentences(text: str) -> List[List[str]]: ## 추후 변경 가능성 높음
-    """
-    텍스트를 문장 단위로 분리 (클로바 문단 분리기 사용함)
-    한글/영어 모두 고려하여 문장 경계 탐지
-    """
-    executor = CLOVASegmentationExecutor()
-    return executor.segment_text(text)
+def limit_tokens(text: str, max_tokens: int=OPENAI_EMBEDDING_MAX_TOKENS) -> str:
+        """토큰 수 제한"""
+        tokens = len(text)
+        if tokens > max_tokens:
+            return text[:int(max_tokens*0.8)]
+        return text
 
-def chunk_text(text: str, max_tokens: int) -> str:
+
+def chunk_financial_data(json_data: List[List[dict]]) -> List[Tuple[Dict, str]]:
     """
-    텍스트를 길이 기준으로 검사하고 필요시 절삭
+    재무제표 데이터를 청크로 분할하고 메타데이터와 함께 반환
     
     Args:
-        text (str): 처리할 텍스트
-        max_tokens (int): 최대 허용 토큰 수
-    
+        json_data: 재무제표 JSON 데이터 리스트
+        
     Returns:
-        str: 처리된 텍스트
+        List[Tuple[Dict, str]]: (메타데이터, 청크) 튜플의 리스트
     """
-    logger = logging.getLogger(__name__)
     
-    # 텍스트 길이의 80%를 계산
-    text_length = len(text)
-    threshold_length = int(text_length * 0.8)
+    # tiktoken 인코더 초기화
     
-    # 80% 길이가 최대 토큰 수를 초과하는지 확인
-    if threshold_length > max_tokens:
-        # 로깅
-        logger.warning(
-            f"텍스트가 최대 허용 길이를 초과합니다.\n"
-            f"원본 길이: {text_length}\n"
-            f"80% 길이: {threshold_length}\n"
-            f"최대 토큰: {max_tokens}\n"
-            f"텍스트가 {max_tokens}토큰까지 절삭됩니다."
-        )
+    def clean_text(text: str) -> str:
+        """텍스트 정제"""
+        if not isinstance(text, str):
+            return ""
+            
+        # HTML 엔터티 디코딩
+        text = html.unescape(text)
         
-        # 텍스트를 max_tokens까지 잘라내기
-        # 문장 중간 절단을 피하기 위해 마지막 마침표나 띄어쓰기를 찾아서 자름
-        cutoff_text = text[:max_tokens]
-        last_period = cutoff_text.rfind('.')
-        last_space = cutoff_text.rfind(' ')
+        # &#x 형태의 유니코드 문자 처리
+        text = re.sub(r'&#x[0-9a-fA-F]+;?', '', text)
         
-        # 마침표나 띄어쓰기 중 더 뒤에 있는 위치에서 자르기
-        cut_position = max(last_period, last_space)
-        if cut_position == -1:  # 마침표나 띄어쓰기가 없는 경우
-            cut_position = max_tokens
+        # 연속된 공백, 탭, 줄바꿈을 단일 공백으로 변환
+        text = re.sub(r'\s+', ' ', text)
         
-        return text[:cut_position].strip()
+        # 불필요한 특수문자 제거 또는 변환
+        text = re.sub(r'[\u200b\ufeff\xa0]', '', text)  # 제로윗스 공백, BOM, 줄바꿈 없는 공백 제거
+        
+        return text.strip()
     
-    # 길이가 초과하지 않으면 원본 텍스트 반환
-    return text
-
-def table_to_text(table: List[List[str]], row_template: str = "{} 항목의 {} 값은 {} 입니다;") -> List[str]:
-    """
-    테이블을 자연어 문장 리스트로 변환
-    """
-    if not table or not table[0]:
-        return []
+    def chunk_text(text: str, max_chars: int = 2048) -> List[str]:
+        """텍스트를 지정된 길이로 청크화"""
+        if not text:
+            return []
         
-    # 헤더 처리
-    headers = table[0]
+        # 텍스트 정제
+        text = clean_text(text)
+        
+        chunks = []
+        current_chunk = ""
+        
+        # 문장 단위로 분리 (마침표 뒤에 공백이 있는 경우만 분리)
+        sentences = re.split(r'(?<=\. )', text)
+        
+        for sentence in sentences:
+            # 현재 청크의 토큰 수 확인
+            potential_chunk = current_chunk + sentence
+            tokens = len(potential_chunk)
+            
+            if tokens < OPENAI_EMBEDDING_MAX_TOKENS*0.8:
+                current_chunk = potential_chunk
+            else:
+                if current_chunk:
+                    # 현재 청크가 있으면 저장
+                    limited_chunk = limit_tokens(current_chunk, OPENAI_EMBEDDING_MAX_TOKENS)
+                    chunks.append(limited_chunk.strip())
+                # 새로운 청크 시작
+                current_chunk = sentence
+        
+        if current_chunk:
+            limited_chunk = limit_tokens(current_chunk, OPENAI_EMBEDDING_MAX_TOKENS)
+            chunks.append(limited_chunk.strip())
+        
+        return chunks
     
-    # 빈 헤더 처리
-    for i in range(len(headers)):
-        if not headers[i].strip():
-            headers[i] = f"열_{i+1}"
+    def process_section(text: str, metadata: Dict, section_type: str) -> List[Tuple[Dict, str]]:
+        # 리스트인 경우 문자열로 변환
+        if isinstance(text, list):
+            text = ' '.join(map(str, text))
+        chunks = chunk_text(text)
+        section_metadata = {**metadata, "section_type": section_type}
+        return [(section_metadata, chunk) for chunk in chunks]
     
-    # 테이블 내용을 자연어 문장으로 변환
-    row_texts = []
-    for row_idx in range(1, len(table)):
-        row = table[row_idx]
-        row_description = f"행_{row_idx}"  # 기본 행 설명
+    def process_table(table: list, metadata: Dict) -> List[Tuple[Dict, str]]:
+        if not table:
+            return []
         
-        # 날짜나 구분자 같은 특별한 값이 있는지 확인
-        for header, value in zip(headers, row):
-            if any(keyword in header.lower() for keyword in ['일자', '날짜', '기간', 'date']):
-                if value and value.strip() and not value.strip().replace("-", "") == "":
-                    row_description = value.strip()
-                    break
-            elif '구분' in header:
-                if value and value.strip() and not value.strip().replace("-", "") == "":
-                    row_description = value.strip()
-                    break
+        # 테이블의 각 셀 정제
+        cleaned_table = [[clean_text(str(cell)) for cell in row] for row in table]
         
-        # 행이 헤더보다 짧은 경우 패딩
-        if len(row) < len(headers):
-            row.extend([""] * (len(headers) - len(row)))
+        # 2차원 리스트를 문자열 테이블로 변환
+        table_str = '\n'.join(['\t'.join(row) for row in cleaned_table])
         
-        row_sentences = []
-        for col_idx, value in enumerate(row[:len(headers)]):
-            if not value.strip() or value.strip().replace("-", "") == "" or value.strip() == row_description:
+        # 토큰 수 제한 적용
+        limited_table = limit_tokens(table_str, OPENAI_EMBEDDING_MAX_TOKENS)
+        
+        table_metadata = {**metadata, "section_type": "table"}
+        return [(table_metadata, limited_table)]
+    
+    results = []
+    
+    # 각 기업의 데이터 처리
+    for company_data in json_data:
+        # 각 섹션 처리
+        for section in company_data:
+            if "metadata" not in section:
+                logging.warning(f"메타데이터가 없는 섹션을 발견했습니다: {section}")
                 continue
             
-            value = value.replace("\n", " ")
-            value = re.sub(r'\s+', ' ', value).strip()
+            metadata = section["metadata"]
             
-            if headers[col_idx] and value:
-                sentence = row_template.format(
-                    row_description,
-                    headers[col_idx].strip(),
-                    value
-                )
-                row_sentences.append(sentence)
-        
-        if row_sentences:
-            row_text = " ".join(row_sentences)
-            row_texts.append(row_text)
+            # pre_text 처리
+            if "pre_text" in section and section["pre_text"]:
+                results.extend(process_section(section["pre_text"], metadata, "pre_text"))
+            
+            # table 처리
+            if "table_ori" in section and section["table_ori"]:
+                results.extend(process_table(section["table_ori"], metadata))
+            
+            # post_text 처리
+            if "post_text" in section and section["post_text"]:
+                results.extend(process_section(section["post_text"], metadata, "post_text"))
     
-    return row_texts
-
-from typing import List, Dict, Tuple, Any
-
-from typing import List, Dict, Tuple, Any
-
-def fin_json_to_list(json_data: List[Dict], metadata_executor: Any) -> List[Tuple[Dict, str]]:
-    """
-    FinQA JSON 데이터를 (메타데이터, 토큰화된 문장) 튜플 리스트로 변환
-    
-    Args:
-        json_data: 단일 또는 복수의 FinQA 형식 문서
-        metadata_executor: 메타데이터 추출을 위한 실행기
-        
-    Returns:
-        List[Tuple[Dict, str]]: (메타데이터, 문장) 튜플의 리스트
-    """
-    # 단일 딕셔너리인 경우 리스트로 변환
-    if isinstance(json_data, dict):
-        json_data = [json_data]
-    
-    result = []
-    all_texts = []
-    
-    # 모든 텍스트 수집
-    for segment in json_data:
-        # pre_text 처리
-        if segment.get('pre_text'):
-            if isinstance(segment['pre_text'], str):
-                all_texts.append(segment['pre_text'])
-            else:
-                all_texts.extend(text for text in segment['pre_text'] if text and text.strip())
-        
-        # post_text 처리
-        if segment.get('post_text'):
-            if isinstance(segment['post_text'], str):
-                all_texts.append(segment['post_text'])
-            else:
-                all_texts.extend(text for text in segment['post_text'] if text and text.strip())
-    
-    # 전체 텍스트에 대해 한 번만 메타데이터 추출 및 문장 분리
-    if all_texts:
-        combined_text = " ".join(all_texts)
-        combined_text = clean_text(combined_text)
-        metadata_result = metadata_executor.extract_metadata(combined_text)
-        
-        sentences = split_into_sentences(combined_text)
-        for sent_list in sentences:
-            for sentence in sent_list:
-                result.append(({**metadata_result, "section": "text"}, sentence))
-    
-    # 테이블 처리
-    for segment in json_data:
-        if segment.get('table_llm'):
-            table_chunks = tableLLM_to_chunk(segment['table_llm'])
-            for chunk in table_chunks:
-                result.append(({**metadata_result, "section": "table"}, chunk))
-        elif segment.get('table_ori'):
-            table_texts = table_to_text(segment['table_ori'])
-            for text in table_texts:
-                result.append(({**metadata_result, "section": "table"}, text))
-    
-    return result
-
-def tableLLM_to_chunk(text: str) -> List[str]:
-    """
-    LLM이 생성한 테이블 설명 텍스트를 청크 리스트로 변환하는 함수
-    
-    Args:
-        text (str): LLM이 생성한 테이블 설명 텍스트
-        
-    Returns:
-        List[str]: [테이블 설명 + 행1 내용, 테이블 설명 + 행2 내용, ...] 형식의 청크 리스트
-    
-    Example:
-        >>> text = "위의 표는 2021년 보고서이다. 회사명은 포스코이다. 대표이사는 김학동이다."
-        >>> chunks = tableLLM_to_chunk(text)
-        >>> print(chunks)
-        ['위의 표는 2021년 보고서이다. 회사명은 포스코이다.',
-         '위의 표는 2021년 보고서이다. 대표이사는 김학동이다.']
-    """
-    # 테이블 설명 추출 (첫 문장)
-    sentences = re.split(r'(?<=[다])\.\s+', text)
-    table_description = sentences[0] + "."
-    
-    # 각 문장을 청크로 변환
-    chunks = []
-    for sentence in sentences[1:]:
-        if not sentence.strip():  # 빈 문장 제외
-            continue
-        # 설명과 현재 문장을 결합하여 청크 생성
-        chunk = f"{table_description} {sentence}."
-        chunks.append(chunk)
-    
-    return chunks
+    return results

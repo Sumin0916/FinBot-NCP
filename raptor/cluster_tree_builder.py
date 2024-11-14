@@ -30,7 +30,7 @@ class ClusterTreeConfig(TreeBuilderConfig):
         self.summarization_length = 100
         
         if clustering_algorithm == RAPTOR_Clustering:
-            self.summarization_length = 100  # RAPTOR는 모든 레이어에서 100 고정
+            self.layer_summarization_lengths = 100  # RAPTOR는 모든 레이어에서 100 고정
         if clustering_algorithm == FinRAG_Clustering:  # FinRAG_Clustering인 경우
             self.layer_summarization_lengths = {
                 0: 300,  # Layer 0 -> 1
@@ -39,11 +39,9 @@ class ClusterTreeConfig(TreeBuilderConfig):
                 3: 1000, # Layer 3 -> 4
             }
 
-    def get_summarization_length(self, layer):
-        """Get summarization length for specific layer"""
-        if self.clustering_algorithm == RAPTOR_Clustering:
-            return 100  # RAPTOR는 항상 100 반환
-        return self.layer_summarization_lengths.get(layer, self.summarization_length)
+    def get_summarization_length(self, layer: int) -> int:
+        """각 레이어의 요약 길이를 반환"""
+        return self.layer_summarization_lengths.get(layer, 300)  # 기본값 300
 
     def log_config(self):
         base_summary = super().log_config()
@@ -59,17 +57,25 @@ class ClusterTreeConfig(TreeBuilderConfig):
 
 class ClusterTreeBuilder(TreeBuilder):
     def __init__(self, config) -> None:
+        # 부모 클래스 초기화 먼저 수행
         super().__init__(config)
-
+        
         if not isinstance(config, ClusterTreeConfig):
             raise ValueError("config must be an instance of ClusterTreeConfig")
+        
+        # ClusterTreeBuilder 특정 속성 설정
+        self.config = config  # config 명시적 설정
         self.reduction_dimension = config.reduction_dimension
-        self.clustering_algorithm = config.clustering_algorithm
+        self.clustering_algorithm = config.clustering_algorithm()  # 인스턴스 생성
         self.clustering_params = config.clustering_params
 
         logging.info(
             f"Successfully initialized ClusterTreeBuilder with Config {config.log_config()}"
         )
+
+    def get_summarization_length(self, layer: int) -> int:
+        """해당 레이어의 요약 길이를 반환"""
+        return self.config.get_summarization_length(layer)
 
     def construct_tree(
         self,
@@ -87,7 +93,7 @@ class ClusterTreeBuilder(TreeBuilder):
         ):
             node_texts = get_text(cluster)
 
-            summarization_length = self.config.get_summarization_length(layer)
+            summarization_length = self.get_summarization_length(layer)  # self.config 대신 메서드 사용
 
             summarized_text = self.summarize(
                 context=node_texts,
@@ -95,9 +101,9 @@ class ClusterTreeBuilder(TreeBuilder):
             )
 
             logging.info(
-            f"Layer {layer} - Node Texts Length: {len(self.tokenizer.encode(node_texts))}, "
-            f"Summarized Text Length: {len(self.tokenizer.encode(summarized_text))} "
-            f"(Target Length: {summarization_length})"
+                f"Layer {layer} - Node Texts Length: {len(self.tokenizer.encode(node_texts))}, "
+                f"Summarized Text Length: {len(self.tokenizer.encode(summarized_text))} "
+                f"(Target Length: {summarization_length})"
             )
 
             __, new_parent_node = self.create_node(
@@ -132,7 +138,7 @@ class ClusterTreeBuilder(TreeBuilder):
 
             lock = Lock()
 
-            summarization_length = self.summarization_length
+            summarization_length = self.config.get_summarization_length(layer)
             logging.info(f"Summarization Length: {summarization_length}")
 
             if use_multithreading:
