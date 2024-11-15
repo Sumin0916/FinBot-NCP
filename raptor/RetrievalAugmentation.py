@@ -274,38 +274,43 @@ class RetrievalAugmentation:
         top_k: int = 10,
         max_tokens: int = 3500,
         collapse_tree: bool = True,
-        return_layer_information: bool = True,
+        return_metadata: bool = False,
+        format_output: bool = False,
     ):
-        """
-        Retrieves information and answers a question using the TreeRetriever instance.
-
-        Args:
-            question (str): The question to answer.
-            start_layer (int): The layer to start from. Defaults to self.start_layer.
-            num_layers (int): The number of layers to traverse. Defaults to self.num_layers.
-            max_tokens (int): The maximum number of tokens. Defaults to 3500.
-            use_all_information (bool): Whether to retrieve information from all nodes. Defaults to False.
-
-        Returns:
-            str: The context from which the answer can be found.
-
-        Raises:
-            ValueError: If the TreeRetriever instance has not been initialized.
-        """
+        """정보를 검색하고 포맷팅합니다."""
         if self.retriever is None:
             raise ValueError(
                 "The TreeRetriever instance has not been initialized. Call 'add_documents' first."
             )
-
-        return self.retriever.retrieve(
-            question,
-            start_layer,
-            num_layers,
-            top_k,
-            max_tokens,
-            collapse_tree,
-            return_layer_information,
-        )
+        
+        try:
+            # TreeRetriever의 retrieve 메서드 호출
+            result = self.retriever.retrieve(
+                question,
+                start_layer=start_layer,
+                num_layers=num_layers,
+                top_k=top_k,
+                max_tokens=max_tokens,
+                collapse_tree=collapse_tree,
+                return_metadata=True,  # 항상 메타데이터를 가져옵니다
+                format_output=format_output,
+            )
+            
+            # format_output이 True인 경우 이미 포맷팅된 문자열이 반환됨
+            if format_output:
+                return result
+            
+            # 그렇지 않은 경우 context와 node_info를 적절히 반환
+            context, node_info = result
+            if return_metadata:
+                return context, node_info
+            return context
+            
+        except Exception as e:
+            logging.error(f"Error in retrieve: {str(e)}")
+            if return_metadata:
+                return "", []
+            return ""
 
     def answer_question(
         self,
@@ -315,36 +320,27 @@ class RetrievalAugmentation:
         num_layers: int = None,
         max_tokens: int = 3500,
         collapse_tree: bool = True,
-        return_layer_information: bool = False,
+        return_metadata: bool = False,
     ):
-        """
-        Retrieves information and answers a question using the TreeRetriever instance.
-
-        Args:
-            question (str): The question to answer.
-            start_layer (int): The layer to start from. Defaults to self.start_layer.
-            num_layers (int): The number of layers to traverse. Defaults to self.num_layers.
-            max_tokens (int): The maximum number of tokens. Defaults to 3500.
-            use_all_information (bool): Whether to retrieve information from all nodes. Defaults to False.
-
-        Returns:
-            str: The answer to the question.
-
-        Raises:
-            ValueError: If the TreeRetriever instance has not been initialized.
-        """
-        # if return_layer_information:
+        """질문에 대한 답변을 생성합니다."""
         search_question = self.qa_model.generate_search_question(question)
         logging.info(f"질문을 해결하기 위한 검색어: {search_question}")
-        context, layer_information = self.retrieve(
-            search_question, start_layer, num_layers, top_k, max_tokens, collapse_tree, True
+        
+        # 한 번의 retrieve 호출로 필요한 모든 정보를 가져옵니다
+        context, node_info = self.retrieve(
+            search_question,
+            start_layer=start_layer,
+            num_layers=num_layers,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            collapse_tree=collapse_tree,
+            return_metadata=True  # 항상 메타데이터를 가져옵니다
         )
-
+        
         answer = self.qa_model.answer_question(context, question)
-
-        if return_layer_information:
-            return answer, layer_information
-
+        
+        if return_metadata:
+            return answer, node_info
         return answer
 
     def save(self, path):

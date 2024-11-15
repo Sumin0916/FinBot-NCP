@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Union, Tuple
 
 import tiktoken
 from tenacity import retry, stop_after_attempt, wait_random_exponential
@@ -195,133 +195,183 @@ class TreeRetriever(BaseRetriever):
         return selected_nodes, context
 
     def retrieve_information(
-        self, current_nodes: List[Node], query: str, num_layers: int
-    ) -> str:
+        self, 
+        current_nodes: List[Node], 
+        query: str, 
+        num_layers: int
+    ) -> Tuple[List[Dict], str]:
         """
         Retrieves the most relevant information from the tree based on the query.
-
-        Args:
-            current_nodes (List[Node]): A List of the current nodes.
-            query (str): The query text.
-            num_layers (int): The number of layers to traverse.
-
-        Returns:
-            str: The context created using the most relevant nodes.
         """
-
+        if not current_nodes:
+            return [], ""
+            
         query_embedding = self.create_embedding(query)
+        selected_node_info = []
 
-        selected_nodes = []
-
-        node_list = current_nodes
+        # 노드 리스트가 정수인 경우 Node 객체로 변환
+        node_list = []
+        for node in current_nodes:
+            if isinstance(node, int):
+                if node in self.tree.all_nodes:
+                    node_list.append(self.tree.all_nodes[node])
+            else:
+                node_list.append(node)
 
         for layer in range(num_layers):
-
+            if not node_list:
+                break
+                
             embeddings = get_embeddings(node_list, self.context_embedding_model)
-
+            
+            if len(embeddings) == 0:
+                continue
+                
             distances = distances_from_embeddings(query_embedding, embeddings)
-
             indices = indices_of_nearest_neighbors_from_distances(distances)
 
             if self.selection_mode == "threshold":
                 best_indices = [
                     index for index in indices if distances[index] > self.threshold
                 ]
+            else:  # "top_k" mode
+                best_indices = indices[:min(self.top_k, len(indices))]
 
-            elif self.selection_mode == "top_k":
-                best_indices = indices[: self.top_k]
+            # 노드 정보 수집
+            for idx in best_indices:
+                try:
+                    node = node_list[idx]
+                    if isinstance(node, int):
+                        if node in self.tree.all_nodes:
+                            node = self.tree.all_nodes[node]
+                        else:
+                            continue
 
-            nodes_to_add = [node_list[idx] for idx in best_indices]
+                    # 노드 정보 생성
+                    node_info = {
+                        "node_id": node.index if hasattr(node, 'index') else str(id(node)),
+                        "layer": self.tree_node_index_to_layer.get(
+                            node.index if hasattr(node, 'index') else str(id(node)), 
+                            -1
+                        ),
+                        "text": node.text if hasattr(node, 'text') else str(node),
+                        "metadata": node.metadata if hasattr(node, 'metadata') else {},
+                        "similarity_score": float(distances[idx]),
+                        "children": []
+                    }
 
-            selected_nodes.extend(nodes_to_add)
+                    # 자식 노드 처리
+                    if hasattr(node, 'children') and node.children:
+                        child_indices = []
+                        for child in node.children:
+                            if isinstance(child, Node):
+                                child_indices.append(child.index)
+                            elif isinstance(child, int):
+                                child_indices.append(child)
+                        node_info["children"] = child_indices
 
+                    selected_node_info.append(node_info)
+                    
+                except Exception as e:
+                    logging.error(f"Error processing node {idx}: {str(e)}")
+                    continue
+
+            # 다음 레이어의 자식 노드 처리
             if layer != num_layers - 1:
-
-                child_nodes = []
-
+                next_layer_nodes = []
                 for index in best_indices:
-                    child_nodes.extend(node_list[index].children)
+                    current_node = node_list[index]
+                    if hasattr(current_node, 'children') and current_node.children:
+                        for child in current_node.children:
+                            if isinstance(child, int):
+                                if child in self.tree.all_nodes:
+                                    next_layer_nodes.append(self.tree.all_nodes[child])
+                            else:
+                                next_layer_nodes.append(child)
+                
+                node_list = list(dict.fromkeys(next_layer_nodes))  # 중복 제거
 
-                # take the unique values
-                child_nodes = list(dict.fromkeys(child_nodes))
-                node_list = [self.tree.all_nodes[i] for i in child_nodes]
-
-        context = get_text(selected_nodes)
-        return selected_nodes, context
+        # 컨텍스트 생성
+        context = "\n".join([
+            info["text"] 
+            for info in selected_node_info 
+            if info.get("text")
+        ])
+        
+        return selected_node_info, context
 
     def retrieve(
         self,
         query: str,
         start_layer: int = None,
         num_layers: int = None,
-        top_k: int = 10, 
+        top_k: int = 10,
         max_tokens: int = 3500,
         collapse_tree: bool = True,
-        return_layer_information: bool = False,
-    ) -> str:
+        return_metadata: bool = True,
+        format_output: bool = False,
+    ) -> Union[str, Tuple[str, List[Dict]], str]:
         """
-        Queries the tree and returns the most relevant information.
-
-        Args:
-            query (str): The query text.
-            start_layer (int): The layer to start from. Defaults to self.start_layer.
-            num_layers (int): The number of layers to traverse. Defaults to self.num_layers.
-            max_tokens (int): The maximum number of tokens. Defaults to 3500.
-            collapse_tree (bool): Whether to retrieve information from all nodes. Defaults to False.
-
-        Returns:
-            str: The result of the query.
+        Enhanced retrieve method with metadata support and error handling.
         """
-
         if not isinstance(query, str):
             raise ValueError("query must be a string")
 
-        if not isinstance(max_tokens, int) or max_tokens < 1:
-            raise ValueError("max_tokens must be an integer and at least 1")
+        # Validate and set defaults
+        start_layer = min(self.start_layer if start_layer is None else start_layer, 
+                         self.tree.num_layers)
+        num_layers = min(self.num_layers if num_layers is None else num_layers,
+                        start_layer + 1)
 
-        if not isinstance(collapse_tree, bool):
-            raise ValueError("collapse_tree must be a boolean")
-
-        # Set defaults
-        start_layer = self.start_layer if start_layer is None else start_layer
-        num_layers = self.num_layers if num_layers is None else num_layers
-
-        if not isinstance(start_layer, int) or not (
-            0 <= start_layer <= self.tree.num_layers
-        ):
-            raise ValueError(
-                "start_layer must be an integer between 0 and tree.num_layers"
-            )
-
-        if not isinstance(num_layers, int) or num_layers < 1:
-            raise ValueError("num_layers must be an integer and at least 1")
-
-        if num_layers > (start_layer + 1):
-            raise ValueError("num_layers must be less than or equal to start_layer + 1")
-
-        if collapse_tree:
-            logging.info(f"Using collapsed_tree")
-            selected_nodes, context = self.retrieve_information_collapse_tree(
-                query, top_k, max_tokens
-            )
-        else:
-            layer_nodes = self.tree.layer_to_nodes[start_layer]
-            selected_nodes, context = self.retrieve_information(
-                layer_nodes, query, num_layers
-            )
-
-        if return_layer_information:
-
-            layer_information = []
-
-            for node in selected_nodes:
-                layer_information.append(
+        try:
+            if collapse_tree:
+                selected_nodes, context = self.retrieve_information_collapse_tree(
+                    query, top_k, max_tokens
+                )
+                # Convert to consistent format
+                node_info = [
                     {
-                        "node_index": node.index,
-                        "layer_number": self.tree_node_index_to_layer[node.index],
+                        "node_id": node.index,
+                        "layer": self.tree_node_index_to_layer.get(node.index, -1),
+                        "text": node.text,
+                        "metadata": node.metadata if hasattr(node, "metadata") else {},
                     }
+                    for node in selected_nodes
+                ]
+            else:
+                layer_nodes = self.tree.layer_to_nodes.get(start_layer, [])
+                if not layer_nodes:
+                    logging.warning(f"No nodes found in layer {start_layer}")
+                    return ("", []) if return_metadata else ""
+                    
+                node_info, context = self.retrieve_information(
+                    layer_nodes, query, num_layers
                 )
 
-            return context, layer_information
+            if format_output:
+                # Create a formatted string representation with error handling
+                output_parts = []
+                for info in node_info:
+                    try:
+                        part = f"Node {info.get('node_id', 'Unknown')} (Layer {info.get('layer', 'Unknown')}):\n"
+                        if info.get('metadata'):
+                            part += "Metadata:\n"
+                            for key, value in info['metadata'].items():
+                                part += f"  {key}: {value}\n"
+                        part += f"Text: {info.get('text', 'No text available')}\n"
+                        if 'similarity_score' in info:
+                            part += f"Similarity Score: {info['similarity_score']:.4f}\n"
+                        if 'children' in info:
+                            part += f"Child Nodes: {info['children']}\n"
+                        part += "-" * 50 + "\n"
+                        output_parts.append(part)
+                    except Exception as e:
+                        logging.error(f"Error formatting node info: {str(e)}")
+                        continue
+                return "\n".join(output_parts)
 
-        return context
+            return (context, node_info) if return_metadata else context
+
+        except Exception as e:
+            logging.error(f"Error in retrieve: {str(e)}")
+            return ("", []) if return_metadata else ""

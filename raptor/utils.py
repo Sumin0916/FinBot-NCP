@@ -37,7 +37,6 @@ def split_text(
     Returns:
         List[str]: A list of text chunks.
     """
-    logger.info("이게 사용되었다~!")
     # Split the text into sentences using multiple delimiters
     delimiters = [".", "!", "?", "\n"]
     regex_pattern = "|".join(map(re.escape, delimiters))
@@ -221,10 +220,10 @@ def limit_tokens(text: str, max_tokens: int=OPENAI_EMBEDDING_MAX_TOKENS) -> str:
             return text[:int(max_tokens*0.8)]
         return text
 
-
 def chunk_financial_data(json_data: List[List[dict]]) -> List[Tuple[Dict, str]]:
     """
     재무제표 데이터를 청크로 분할하고 메타데이터와 함께 반환
+    중복되는 텍스트는 제외하여 처리
     
     Args:
         json_data: 재무제표 JSON 데이터 리스트
@@ -232,8 +231,6 @@ def chunk_financial_data(json_data: List[List[dict]]) -> List[Tuple[Dict, str]]:
     Returns:
         List[Tuple[Dict, str]]: (메타데이터, 청크) 튜플의 리스트
     """
-    
-    # tiktoken 인코더 초기화
     
     def clean_text(text: str) -> str:
         """텍스트 정제"""
@@ -250,91 +247,117 @@ def chunk_financial_data(json_data: List[List[dict]]) -> List[Tuple[Dict, str]]:
         text = re.sub(r'\s+', ' ', text)
         
         # 불필요한 특수문자 제거 또는 변환
-        text = re.sub(r'[\u200b\ufeff\xa0]', '', text)  # 제로윗스 공백, BOM, 줄바꿈 없는 공백 제거
+        text = re.sub(r'[\u200b\ufeff\xa0]', '', text)
         
         return text.strip()
-    
-    def chunk_text(text: str, max_chars: int = 2048) -> List[str]:
-        """텍스트를 지정된 길이로 청크화"""
-        if not text:
+
+    def process_text_list(text_list: List[str], seen_texts: Set[str], max_tokens: int = OPENAI_EMBEDDING_MAX_TOKENS) -> List[str]:
+        """텍스트 리스트를 토큰 제한에 맞게 처리하고 중복 제거"""
+        if not text_list:
             return []
-        
-        # 텍스트 정제
-        text = clean_text(text)
-        
-        chunks = []
-        current_chunk = ""
-        
-        # 문장 단위로 분리 (마침표 뒤에 공백이 있는 경우만 분리)
-        sentences = re.split(r'(?<=\. )', text)
-        
-        for sentence in sentences:
-            # 현재 청크의 토큰 수 확인
-            potential_chunk = current_chunk + sentence
-            tokens = len(potential_chunk)
             
-            if tokens < OPENAI_EMBEDDING_MAX_TOKENS*0.8:
-                current_chunk = potential_chunk
-            else:
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for text in text_list:
+            cleaned_text = clean_text(text)
+            if not cleaned_text or cleaned_text in seen_texts:
+                continue
+                
+            seen_texts.add(cleaned_text)
+            text_tokens = len(cleaned_text)
+            
+            if current_length + text_tokens > max_tokens * 0.8:
                 if current_chunk:
-                    # 현재 청크가 있으면 저장
-                    limited_chunk = limit_tokens(current_chunk, OPENAI_EMBEDDING_MAX_TOKENS)
-                    chunks.append(limited_chunk.strip())
-                # 새로운 청크 시작
-                current_chunk = sentence
+                    combined_text = ' '.join(current_chunk)
+                    limited_text = limit_tokens(combined_text, max_tokens)
+                    chunks.append(limited_text)
+                current_chunk = [cleaned_text]
+                current_length = text_tokens
+            else:
+                current_chunk.append(cleaned_text)
+                current_length += text_tokens
         
         if current_chunk:
-            limited_chunk = limit_tokens(current_chunk, OPENAI_EMBEDDING_MAX_TOKENS)
-            chunks.append(limited_chunk.strip())
-        
+            combined_text = ' '.join(current_chunk)
+            limited_text = limit_tokens(combined_text, max_tokens)
+            chunks.append(limited_text)
+            
         return chunks
-    
-    def process_section(text: str, metadata: Dict, section_type: str) -> List[Tuple[Dict, str]]:
-        # 리스트인 경우 문자열로 변환
-        if isinstance(text, list):
-            text = ' '.join(map(str, text))
-        chunks = chunk_text(text)
-        section_metadata = {**metadata, "section_type": section_type}
-        return [(section_metadata, chunk) for chunk in chunks]
-    
-    def process_table(table: list, metadata: Dict) -> List[Tuple[Dict, str]]:
+
+    def process_table(table: List[List[str]], seen_texts: Set[str], llm_table: Union[str, List[str]] = "") -> str:
+        """
+        테이블 데이터 처리 및 중복 제거
+        
+        Args:
+            table: 원본 테이블 데이터 (2차원 리스트)
+            seen_texts: 이미 처리된 텍스트 집합
+            llm_table: LLM이 처리한 테이블 문자열 또는 문자열 리스트
+        
+        Returns:
+            str: 처리된 테이블 문자열
+        """
         if not table:
-            return []
+            return ""
         
-        # 테이블의 각 셀 정제
+        # LLM 처리된 테이블이 있으면 그것을 사용
+        if isinstance(llm_table, list):
+            llm_text = ' '.join(llm_table)
+        else:
+            llm_text = str(llm_table)
+            
+        if llm_text.strip():
+            cleaned_llm_text = clean_text(llm_text)
+            if cleaned_llm_text in seen_texts:
+                return ""
+            seen_texts.add(cleaned_llm_text)
+            return limit_tokens(cleaned_llm_text, OPENAI_EMBEDDING_MAX_TOKENS)
+        
+        # LLM 처리된 테이블이 없으면 원본 테이블 사용
         cleaned_table = [[clean_text(str(cell)) for cell in row] for row in table]
-        
-        # 2차원 리스트를 문자열 테이블로 변환
         table_str = '\n'.join(['\t'.join(row) for row in cleaned_table])
         
-        # 토큰 수 제한 적용
-        limited_table = limit_tokens(table_str, OPENAI_EMBEDDING_MAX_TOKENS)
+        cleaned_table_str = clean_text(table_str)
+        if cleaned_table_str in seen_texts:
+            return ""
+        seen_texts.add(cleaned_table_str)
         
-        table_metadata = {**metadata, "section_type": "table"}
-        return [(table_metadata, limited_table)]
-    
+        return limit_tokens(cleaned_table_str, OPENAI_EMBEDDING_MAX_TOKENS)
+
     results = []
+    seen_texts = set()  # 중복 체크를 위한 집합
     
-    # 각 기업의 데이터 처리
-    for company_data in json_data:
-        # 각 섹션 처리
-        for section in company_data:
+    for doc in json_data:
+        for section in doc:
             if "metadata" not in section:
                 logging.warning(f"메타데이터가 없는 섹션을 발견했습니다: {section}")
                 continue
-            
+                
             metadata = section["metadata"]
             
-            # pre_text 처리
-            if "pre_text" in section and section["pre_text"]:
-                results.extend(process_section(section["pre_text"], metadata, "pre_text"))
+            # pre_text 처리 (리스트로 되어있음)
+            if section.get("pre_text"):
+                pre_chunks = process_text_list(section["pre_text"], seen_texts)
+                for chunk in pre_chunks:
+                    if chunk.strip():
+                        results.append(({**metadata, "section_type": "pre_text"}, chunk))
             
-            # table 처리
-            if "table_ori" in section and section["table_ori"]:
-                results.extend(process_table(section["table_ori"], metadata))
+            # table 처리 (원본 테이블과 LLM 처리된 테이블 모두 포함)
+            if section.get("table_ori"):
+                table_text = process_table(
+                    section["table_ori"],
+                    seen_texts,
+                    section.get("table_llm", "")
+                )
+                if table_text.strip():
+                    results.append(({**metadata, "section_type": "table"}, table_text))
             
-            # post_text 처리
-            if "post_text" in section and section["post_text"]:
-                results.extend(process_section(section["post_text"], metadata, "post_text"))
+            # post_text 처리 (리스트로 되어있음)
+            if section.get("post_text"):
+                post_chunks = process_text_list(section["post_text"], seen_texts)
+                for chunk in post_chunks:
+                    if chunk.strip():
+                        results.append(({**metadata, "section_type": "post_text"}, chunk))
     
     return results

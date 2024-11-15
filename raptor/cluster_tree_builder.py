@@ -41,7 +41,9 @@ class ClusterTreeConfig(TreeBuilderConfig):
 
     def get_summarization_length(self, layer: int) -> int:
         """각 레이어의 요약 길이를 반환"""
-        return self.layer_summarization_lengths.get(layer, 300)  # 기본값 300
+        if isinstance(self.layer_summarization_lengths, dict):
+            return self.layer_summarization_lengths.get(layer, 300)  # 기본값 300
+        return self.layer_summarization_lengths  # RAPTOR의 경우 고정값 100 반환
 
     def log_config(self):
         base_summary = super().log_config()
@@ -56,26 +58,32 @@ class ClusterTreeConfig(TreeBuilderConfig):
 
 
 class ClusterTreeBuilder(TreeBuilder):
-    def __init__(self, config) -> None:
-        # 부모 클래스 초기화 먼저 수행
+    def __init__(self, config: ClusterTreeConfig) -> None:
         super().__init__(config)
         
         if not isinstance(config, ClusterTreeConfig):
             raise ValueError("config must be an instance of ClusterTreeConfig")
         
-        # ClusterTreeBuilder 특정 속성 설정
-        self.config = config  # config 명시적 설정
+        self.config = config
         self.reduction_dimension = config.reduction_dimension
-        self.clustering_algorithm = config.clustering_algorithm()  # 인스턴스 생성
+        self.clustering_algorithm = config.clustering_algorithm()
         self.clustering_params = config.clustering_params
 
-        logging.info(
-            f"Successfully initialized ClusterTreeBuilder with Config {config.log_config()}"
-        )
+        logging.info(f"Successfully initialized ClusterTreeBuilder with Config {config.log_config()}")
 
-    def get_summarization_length(self, layer: int) -> int:
-        """해당 레이어의 요약 길이를 반환"""
-        return self.config.get_summarization_length(layer)
+    def check_termination_condition(self, node_list: List[Node], clusters: List[List[Node]], layer: int) -> bool:
+        """클러스터링 알고리즘별 종료 조건 체크"""
+        if isinstance(self.clustering_algorithm, RAPTOR_Clustering):
+            if len(node_list) <= self.reduction_dimension + 1:
+                self.num_layers = layer
+                logging.info(f"Tree construction stopped at layer {layer} (not enough nodes)")
+                return True
+        elif isinstance(self.clustering_algorithm, FinRAG_Clustering):
+            if layer >= 4:  # 레이어 3까지 완료한 후 종료
+                self.num_layers = layer + 1
+                logging.info(f"Tree construction completed after layer 3")
+                return True
+        return False
 
     def construct_tree(
         self,
@@ -84,92 +92,106 @@ class ClusterTreeBuilder(TreeBuilder):
         layer_to_nodes: Dict[int, List[Node]],
         use_multithreading: bool = False,
     ) -> Dict[int, Node]:
-        logging.info("Using Cluster TreeBuilder")
-
+        logging.info(f"Using {self.clustering_algorithm.__class__.__name__}")
+        
         next_node_index = len(all_tree_nodes)
-
+        
         def process_cluster(
-            cluster, new_level_nodes, next_node_index, layer, lock
-        ):
+            self,
+            cluster: List[Node],
+            new_level_nodes: Dict[int, Node],
+            next_node_index: int,
+            layer: int,
+            lock: Lock
+        ) -> None:
             node_texts = get_text(cluster)
-
-            summarization_length = self.get_summarization_length(layer)  # self.config 대신 메서드 사용
-
+            summarization_length = self.config.get_summarization_length(layer)
+            
             summarized_text = self.summarize(
                 context=node_texts,
                 max_tokens=summarization_length,
             )
-
+            
             logging.info(
-                f"Layer {layer} - Node Texts Length: {len(self.tokenizer.encode(node_texts))}, "
-                f"Summarized Text Length: {len(self.tokenizer.encode(summarized_text))} "
-                f"(Target Length: {summarization_length})"
+                f"Layer {layer} - Nodes: {len(cluster)}, "
+                f"Text Length: {len(self.tokenizer.encode(node_texts))}, "
+                f"Summary Length: {len(self.tokenizer.encode(summarized_text))}, "
+                f"Target Length: {summarization_length}"
             )
-
+            
+            # 클러스터의 메타데이터 생성
+            cluster_metadata = {}  # 기본값 설정
+            if isinstance(self.clustering_algorithm, RAPTOR_Clustering):
+                cluster_metadata = self.clustering_algorithm.create_metadata_for_cluster(cluster)
+            elif isinstance(self.clustering_algorithm, FinRAG_Clustering):
+                cluster_metadata = self.clustering_algorithm.create_metadata_for_cluster(cluster, layer)  # layer 인자 추가
+            
             __, new_parent_node = self.create_node(
-                next_node_index, summarized_text, {node.index for node in cluster}
+                next_node_index,
+                summarized_text,
+                {node.index for node in cluster},
+                metadata=cluster_metadata  # 생성된 메타데이터 전달
             )
-
+            
             with lock:
                 new_level_nodes[next_node_index] = new_parent_node
-
+    
+            return
+        
         for layer in range(self.num_layers):
-
             new_level_nodes = {}
-
-            logging.info(f"Constructing Layer {layer}")
-
             node_list_current_layer = get_node_list(current_level_nodes)
-
-            if len(node_list_current_layer) <= self.reduction_dimension + 1:
-                self.num_layers = layer
-                logging.info(
-                    f"Stopping Layer construction: Cannot Create More Layers. Total Layers in tree: {layer}"
-                )
-                break
-
+            
+            # 클러스터링 수행
             clusters = self.clustering_algorithm.perform_clustering(
                 node_list_current_layer,
                 self.cluster_embedding_model,
-                layer=layer,  # 현재 레이어 정보 전달
+                layer=layer,
                 reduction_dimension=self.reduction_dimension,
-                **self.clustering_params,
+                **self.clustering_params
             )
-
+            
+            # 알고리즘별 종료 조건 체크
+            if self.check_termination_condition(node_list_current_layer, clusters, layer):
+                break
+            
+            # 클러스터 처리
             lock = Lock()
-
-            summarization_length = self.config.get_summarization_length(layer)
-            logging.info(f"Summarization Length: {summarization_length}")
-
             if use_multithreading:
-                with ThreadPoolExecutor() as executor:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = []
                     for cluster in clusters:
-                        executor.submit(
+                        future = executor.submit(
                             process_cluster,
+                            self,
                             cluster,
                             new_level_nodes,
                             next_node_index,
                             layer,
-                            lock,
+                            lock
                         )
+                        futures.append(future)
                         next_node_index += 1
-                    executor.shutdown(wait=True)
-
+                    for future in futures:
+                        future.result()  # 모든 쓰레드 완료 대기
             else:
                 for cluster in clusters:
                     process_cluster(
+                        self,
                         cluster,
                         new_level_nodes,
                         next_node_index,
                         layer,
-                        lock,
+                        lock
                     )
                     next_node_index += 1
-
+            
+            # 레이어 정보 업데이트
             layer_to_nodes[layer + 1] = list(new_level_nodes.values())
             current_level_nodes = new_level_nodes
             all_tree_nodes.update(new_level_nodes)
-
+            
+            # 트리 갱신
             tree = Tree(
                 all_tree_nodes,
                 layer_to_nodes[layer + 1],
@@ -177,5 +199,5 @@ class ClusterTreeBuilder(TreeBuilder):
                 layer + 1,
                 layer_to_nodes,
             )
-
+        
         return current_level_nodes

@@ -1,7 +1,7 @@
 import logging
 import random
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Dict
 from collections import defaultdict
 
 import numpy as np
@@ -125,106 +125,190 @@ def perform_clustering(
 
 
 class ClusteringAlgorithm(ABC):
+    """클러스터링 알고리즘을 위한 기본 추상 클래스"""
+    
     @abstractmethod
-    def perform_clustering(self, embeddings: np.ndarray, **kwargs) -> List[List[int]]:
-        pass
-
-
-class RAPTOR_Clustering(ClusteringAlgorithm):
     def perform_clustering(
-        nodes: List[Node],
-        embedding_model_name: str,
-        max_length_in_cluster: int = 3500,
-        tokenizer=tiktoken.get_encoding("cl100k_base"),
-        reduction_dimension: int = 10,
-        threshold: float = 0.1,
-        verbose: bool = False,
-    ) -> List[List[Node]]:
-        # Get the embeddings from the nodes
-        embeddings = np.array([node.embeddings[embedding_model_name] for node in nodes])
-
-        # Perform the clustering
-        clusters = perform_clustering(
-            embeddings, dim=reduction_dimension, threshold=threshold
-        )
-
-        # Initialize an empty list to store the clusters of nodes
-        node_clusters = []
-
-        # Iterate over each unique label in the clusters
-        for label in np.unique(np.concatenate(clusters)):
-            # Get the indices of the nodes that belong to this cluster
-            indices = [i for i, cluster in enumerate(clusters) if label in cluster]
-
-            # Add the corresponding nodes to the node_clusters list
-            cluster_nodes = [nodes[i] for i in indices]
-
-            # Base case: if the cluster only has one node, do not attempt to recluster it
-            if len(cluster_nodes) == 1:
-                node_clusters.append(cluster_nodes)
-                continue
-
-            # Calculate the total length of the text in the nodes
-            total_length = sum(
-                [len(tokenizer.encode(node.text)) for node in cluster_nodes]
-            )
-
-            # If the total length exceeds the maximum allowed length, recluster this cluster
-            if total_length > max_length_in_cluster:
-                if verbose:
-                    logging.info(
-                        f"reclustering cluster with {len(cluster_nodes)} nodes"
-                    )
-                node_clusters.extend(
-                    RAPTOR_Clustering.perform_clustering(
-                        cluster_nodes, embedding_model_name, max_length_in_cluster
-                    )
-                )
-            else:
-                node_clusters.append(cluster_nodes)
-
-        return node_clusters
-
-class FinRAG_Clustering(ClusteringAlgorithm):
-    @staticmethod
-    def perform_clustering(
+        self,
         nodes: List[Node],
         embedding_model_name: str,
         layer: int = 0,
         **kwargs
     ) -> List[List[Node]]:
-        
-        def group_by_metadata(nodes: List[Node], metadata_keys: List[str]) -> List[List[Node]]:
-            groups = defaultdict(list)
-            
-            for node in nodes:
-                # 메타데이터 키 조합으로 그룹화
-                group_key = tuple(node.metadata.get(k, '') for k in metadata_keys)
-                groups[group_key].append(node)
-                
-            return list(groups.values())
+        """클러스터링 수행을 위한 추상 메서드"""
+        pass
+    
+    @abstractmethod
+    def get_summary_length(self, layer: int) -> int:
+        """레이어별 요약 길이를 반환하는 추상 메서드"""
+        pass
 
-        # 레이어별 요약 길이 설정
-        summary_lengths = {
-            0: 300,  # Document -> Year clusters
-            1: 200,  # Year -> Company clusters  
-            2: 100,  # Company -> Sector clusters
-            3: 1000  # Sector -> Final summary
+
+class RAPTOR_Clustering(ClusteringAlgorithm):
+    """RAPTOR 클러스터링 구현"""
+    
+    def __init__(self, max_length_in_cluster: int = 3500, summary_length: int = 300):
+        self.max_length_in_cluster = max_length_in_cluster
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.summary_length = summary_length  # 모든 레이어에 대해 동일한 요약 길이 사용
+    
+    def perform_clustering(
+        self,
+        nodes: List[Node],
+        embedding_model_name: str,
+        layer: int = 0,
+        reduction_dimension: int = 10,
+        threshold: float = 0.1,
+        **kwargs
+    ) -> List[List[Node]]:
+        embeddings = np.array([node.embeddings[embedding_model_name] for node in nodes])
+        clusters = perform_clustering(embeddings, dim=reduction_dimension, threshold=threshold)
+        
+        node_clusters = []
+        for label in np.unique(np.concatenate(clusters)):
+            indices = [i for i, cluster in enumerate(clusters) if label in cluster]
+            cluster_nodes = [nodes[i] for i in indices]
+            
+            if len(cluster_nodes) == 1:
+                node_clusters.append(cluster_nodes)
+                continue
+            
+            total_length = sum(
+                len(self.tokenizer.encode(node.text)) for node in cluster_nodes
+            )
+            
+            if total_length > self.max_length_in_cluster:
+                node_clusters.extend(
+                    self.perform_clustering(
+                        cluster_nodes,
+                        embedding_model_name,
+                        layer,
+                        reduction_dimension,
+                        threshold
+                    )
+                )
+            else:
+                node_clusters.append(cluster_nodes)
+        
+        return node_clusters
+    
+    def get_summary_length(self, layer: int) -> int:
+        """모든 레이어에 대해 동일한 요약 길이 반환"""
+        return self.summary_length
+
+
+class FinRAG_Clustering(ClusteringAlgorithm):
+    """금융 문서를 위한 메타데이터 기반 계층적 클러스터링"""
+    logging.getLogger
+    def __init__(self):
+        self.clustering_config = {
+            0: {
+                'metadata_keys': ['sector', 'companyName', 'year'],
+                'summary_length': 300,
+                'description': 'Initial metadata'
+            },
+            1: {
+                'metadata_keys': ['year'],  # Squash Years
+                'summary_length': 200,
+                'description': 'Year-level clustering'
+            },
+            2: {
+                'metadata_keys': ['sector', 'companyName'],  # Group by sector and company
+                'summary_length': 100,
+                'description': 'Company-level clustering'
+            },
+            3: {
+                'metadata_keys': ['sector'],  # Group by sector
+                'summary_length': 1000,
+                'description': 'Sector-level clustering'
+            },
+            4: {
+                'metadata_keys': [],  # Finally group
+                'summary_length': 1500,
+                'description': 'Final-level clustering'
+            }
         }
 
-        # 레이어별 클러스터링 전략
-        if layer == 0:
-            # Documents -> Year clusters (300 tokens)
-            return group_by_metadata(nodes, ['year'])
+    def get_summary_length(self, layer: int) -> int:
+        """각 레이어의 요약 길이를 반환"""
+        return self.clustering_config[layer]['summary_length']
+    
+    def create_metadata_for_cluster(self, nodes: List[Node], layer: int = 0) -> Dict:
+        """클러스터의 메타데이터 생성
+        
+        Args:
+            nodes: 클러스터에 포함된 노드 리스트
+            layer: 현재 레이어 번호 (기본값: 0)
+        """
+        if not nodes:
+            return {}
             
-        elif layer == 1:  
-            # Year -> Company clusters (200 tokens)
-            return group_by_metadata(nodes, ['company'])
-            
-        elif layer == 2:
-            # Company -> Sector clusters (100 tokens) 
-            return group_by_metadata(nodes, ['sector'])
-            
-        else:
-            # Final layer - combine all sectors (1000 tokens)
-            return [nodes]
+        base_metadata = {}
+        
+        # 현재 레이어에서 유지해야 할 메타데이터 키 가져오기
+        metadata_keys = self.clustering_config[layer]['metadata_keys']
+        
+        # 각 메타데이터 키에 대해 처리
+        for key in metadata_keys:
+            values = {node.metadata.get(key) for node in nodes}
+            if len(values) == 1:  # 모든 노드가 같은 값을 가질 때
+                base_metadata[key] = next(iter(values))  # 유일한 값 사용
+            else:
+                base_metadata[key] = 'all'  # 다른 값이 있을 경우 'all' 사용
+                
+        return base_metadata
+    
+    def perform_clustering(self, nodes: List[Node], embedding_model, layer: int = 0, **kwargs) -> List[List[Node]]:
+        config = self.clustering_config[layer]
+        metadata_keys = config['metadata_keys']
+        description = config['description']
+
+        logging.info(f"Layer {layer} - {description}: Clustering by {metadata_keys}")
+        
+        if layer >= 4:  # 마지막 레이어에 도달했을 때
+            logging.info(f"Final summary layer reached")
+            return [nodes]  # 모든 노드를 하나의 클러스터로
+
+        # 메타데이터 기반 그룹핑
+        groups = defaultdict(list)
+        
+        for node in nodes:
+            if layer == 1:  # year 기반 클러스터링
+                # year만으로 그룹화
+                group_key = str(node.metadata.get('year', 'unknown'))
+                groups[group_key].append(node)
+                
+            elif layer == 2:  # sector와 companyName 기반 클러스터링
+                # sector와 companyName을 조합하여 그룹화
+                sector = node.metadata.get('sector', 'unknown')
+                company = node.metadata.get('companyName', 'unknown')
+                group_key = f"{sector}_{company}"
+                groups[group_key].append(node)
+                
+            elif layer == 3:  # sector 기반 클러스터링
+                # sector만으로 그룹화
+                group_key = str(node.metadata.get('sector', 'unknown'))
+                groups[group_key].append(node)
+                
+            elif layer == 0:  # 초기 메타데이터 기반 클러스터링 (year, sector, companyName)
+                # 모든 메타데이터를 조합하여 가장 상세한 그룹화
+                year = node.metadata.get('year', 'unknown')
+                sector = node.metadata.get('sector', 'unknown')
+                company = node.metadata.get('companyName', 'unknown')
+                group_key = f"{year}_{sector}_{company}"
+                groups[group_key].append(node)
+
+        logging.info(f"Created {len(groups)} clusters")
+        
+        # 빈 클러스터 제거
+        valid_groups = [group for group in groups.values() if group]
+
+        # 클러스터의 메타데이터 생성 및 로깅
+        for group in valid_groups:
+            group_meta = self.create_metadata_for_cluster(group, layer)
+            logging.info(f"Group (Year={group_meta.get('year', 'all')}, "
+                        f"Sector={group_meta.get('sector', 'all')}, "
+                        f"Company={group_meta.get('companyName', 'all')}): "
+                        f"{len(group)} nodes")
+        
+        return valid_groups
